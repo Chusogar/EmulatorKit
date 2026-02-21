@@ -124,7 +124,7 @@ int divide_load_rom(divide_state_t *s, const char *path)
     } else if (l == 524288) {
         s->divide = 2;
     } else {
-        fprintf(stderr, "spectrum: divide.rom invalid.\n");
+        fprintf(stderr, "[DivIDE] ROM size invalid: expected 8192 or 524288 bytes.\n");
         return -1;
     }
     return 0;

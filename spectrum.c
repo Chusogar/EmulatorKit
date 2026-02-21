@@ -488,7 +488,8 @@ static void io_write(int unused, uint16_t addr, uint8_t val)
             fdc_set_motor(fdc, 0);
         recalc_mmu();
     }
-    divide_io_write(&divide_ctx, addr, val);
+    if (divide_is_enabled(&divide_st))
+        divide_io_write(&divide_ctx, addr, val);
 }
 
 static unsigned int nbytes;
