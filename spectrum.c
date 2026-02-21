@@ -43,8 +43,9 @@
 #include "ide.h"
 #include "lib765/include/765.h"
 #include "tzx.h"
-#include "tape.h"
-#include "sna.h"
+#include "src/tape.h"
+#include "src/sna.h"
+#include "src/divide.h"
 
 #include <SDL2/SDL.h>
 #include "event.h"
@@ -93,23 +94,18 @@ static unsigned vram = RAM(5);
 static unsigned drawline;      /* If rasterising */
 static unsigned blanked;       /* True if blanked */
 
-static uint8_t divmem[524288];/* Full 512K emulated */
-static uint8_t divrom[524288];
-static uint8_t divide_latch;
-static unsigned divide_mapped; /* 0 no, 1 yes */
-static unsigned divide_oe;
-static unsigned divide_pair;   /* Latches other half of wordstream for IDE */
-static unsigned divide;
-
-static uint8_t divplus_latch;
-static unsigned divplus_128k = 1;
-static unsigned divplus_7ffd;
+static divide_state_t divide_st;
+static divide_ctx_t   divide_ctx;
 
 #define ZX_48K_2    0
 #define ZX_48K_3    1
 #define ZX_128K     2
 #define ZX_PLUS3    3
 static unsigned model = ZX_48K_3;
+
+/* ── Public wrappers used by the divide module (divide.c) ── */
+unsigned spectrum_get_model(void)  { return model; }
+uint8_t  spectrum_get_mlatch(void) { return mlatch; }
 
 static volatile int emulator_done;
 static unsigned fast;
@@ -238,70 +234,6 @@ static inline uint8_t kempston_state_from_sdl(void)
     return v;
 }
 
-static uint8_t *divbank(unsigned bank, unsigned page, unsigned off)
-{
-    bank <<= 2;
-    bank |= page;
-    return &divmem[bank * 0x2000 + (off & 0x1FFF)];
-}
-
-static uint8_t *divide_getmap(unsigned addr, unsigned w)
-{
-    unsigned bank = 0;
-    if (divide == 2) {
-        switch(divplus_latch & 0xC0) {
-        case 0x00:  /* DivIDE mode */
-            bank = (divplus_latch >> 1) & 0x0F;
-            break;
-        case 0x40:
-            if (w & (divplus_latch & 0x20))
-                return NULL;
-            return &divmem[((divplus_latch & 0x1F) << 14) +
-                (addr & 0x3FFF)];
-        case 0x80:
-            if (w)
-                return NULL;
-            return &divrom[((divplus_latch & 0x1F) << 14) +
-                (addr & 0x3FFF)];
-        }
-    }
-    /* TODO mapmem should probably stop RAM 3 writes without CONMEM
-       even if 2000-3FFF */
-    if (addr & 0x2000)
-        return divbank(bank, divide_latch & 3, addr);
-    /* CONMEM */
-    if (divide_latch & 0x80) {
-        if (w)
-            return NULL;
-        if (divide == 2)
-            return divrom + bank * 0x8000 + 0x6000 + (addr & 0x1FFF);
-        else
-            return divrom + (addr & 0x1FFF);
-    }
-    /* MAPMEM */
-    if (divide_latch & 0x40) {
-        if (w)
-            return NULL;
-        return divbank(bank, 3, addr);
-    }
-    if (divide == 2)
-        return divrom + bank * 0x8000 + 0x6000 + (addr & 0x1FFF);
-    else
-        return divrom + (addr & 0x1FFF);
-}
-
-static void divide_write(uint16_t addr, uint8_t val)
-{
-    uint8_t *p = divide_getmap(addr, 1);
-    if (p)
-        *p = val;
-}
-
-static uint8_t divide_read(uint16_t addr)
-{
-    return *divide_getmap(addr, 0);
-}
-
 /* TODO: memory contention */
 static uint8_t do_mem_read(uint16_t addr, unsigned debug)
 {
@@ -309,8 +241,8 @@ static uint8_t do_mem_read(uint16_t addr, unsigned debug)
     /* For now until banked stuff */
     if (addr >= mem)
         return 0xFF;
-    if (addr < 0x4000 && divide_mapped == 1)
-        return divide_read(addr);
+    if (addr < 0x4000 && divide_is_mapped(&divide_st))
+        return divide_mem_read(&divide_st, addr);
     return ram[bank][addr & 0x3FFF];
 }
 
@@ -319,8 +251,8 @@ static void mem_write(int unused, uint16_t addr, uint8_t val)
     unsigned bank = map[addr >> 14];
     if (addr >= mem)
         return;
-    if (addr < 0x4000 && divide_mapped == 1) {
-        divide_write(addr, val);
+    if (addr < 0x4000 && divide_is_mapped(&divide_st)) {
+        divide_mem_write(&divide_st, addr, val);
         return;
     }
     /* ROM is read only */
@@ -334,28 +266,15 @@ static uint8_t mem_read(int unused, uint16_t addr)
     uint8_t r;
 
     /* DivIDE+ modes other than 00 don't autopage */
-    if (cpu_z80.M1 && !(divplus_latch & 0xC0)) {
-        /* Immediate map */
-        if (divide == 1 && addr >= 0x3D00 && addr <= 0x3DFF)
-            divide_mapped = 1;
-        /* TODO: correct this based on the B4 latch and 128K flag */
-        if (divide == 2 && (model <= ZX_48K_3 || !divplus_128k || (mlatch & 0x10)) && addr >= 0x3D00 && addr <= 0x3DFF)
-            divide_mapped = 1;
-    }
+    if (cpu_z80.M1)
+        divide_m1_pre(&divide_ctx, addr);
 
     r = do_mem_read(addr, 0);
 
     /* Look for ED with M1, followed directly by 4D and if so trigger
        the interrupt chain */
     if (cpu_z80.M1) {
-        if (!(divplus_latch & 0xC0)) {
-            /* ROM paging logic */
-            if (divide && addr >= 0x1FF8 && addr <= 0x1FFF)
-                divide_mapped = 0;
-            if (divide && (addr == 0x0000 || addr == 0x0008 || addr == 0x0038 ||
-                addr == 0x0066 || addr == 0x04C6 || addr == 0x0562))
-                divide_mapped = 1;
-        }
+        divide_m1_post(&divide_st, addr);
         /* DD FD CB see the Z80 interrupt manual */
         if (r == 0xDD || r == 0xFD || r == 0xCB) {
             rstate = 2;
@@ -515,40 +434,9 @@ static uint8_t floating(void)
     return 0xFF;
 }
 
-static void divplus_ctrl(uint8_t val)
-{
-    divplus_latch = val;
-    switch(val & 0xE0) {
-    case 0xC0:
-    case 0xE0:
-        divide_latch = 0;
-        divplus_latch = 0;
-        divplus_7ffd = 0;
-        divide_mapped = 0;
-        break;
-    case 0x00:
-        /* DivIDE mode */
-        /* bits 4-1 selects the extended banking */
-        break;
-    case 0x20:
-        /* Enable 128K mode */
-        divplus_128k = 1;
-        break;
-        /* RAM mode: 10WAAAAA */
-        /* 32K pages x 16K replace Spectrum ROM, DivIDE traps off */
-    case 0x40:
-    case 0x60:
-        break;
-    case 0x80:
-        /* ROM mode: as above for 16K ROM banks */
-    case 0xA0:
-        break;
-    }
-}
-
 static uint8_t io_read(int unused, uint16_t addr)
 {
-    unsigned r;
+    int r;
 
     /* Kempston joystick: puerto 0x1F */
     if ((addr & 0xFF) == 0x1F) {
@@ -564,23 +452,9 @@ static uint8_t io_read(int unused, uint16_t addr)
         if ((addr & 0xF002) == 0x3000)
             return fdc_read_data(fdc);
     }
-    if (divide) {
-        if ((addr & 0xE3) == 0xA3) {
-            r = (addr >> 2) & 0x07;
-            if (r) {
-                divide_oe = 1;  /* Odd mode */
-                return ide_read16(ide, r);
-            }
-            if (divide_oe == 0) {
-                divide_oe = 1;
-                return divide_pair;
-            }
-            r = ide_read16(ide, 0);
-            divide_pair = r >> 8;
-            divide_oe = 0;
-            return r & 0xFF;
-        }
-    }
+    r = divide_io_read(&divide_ctx, addr);
+    if (r >= 0)
+        return (uint8_t)r;
     return floating();
 }
 
@@ -614,30 +488,7 @@ static void io_write(int unused, uint16_t addr, uint8_t val)
             fdc_set_motor(fdc, 0);
         recalc_mmu();
     }
-    if (divide) {
-        if ((addr & 0xE3) == 0xA3) {
-            uint8_t r = (addr >> 2) & 0x07;
-            if (r) {
-                divide_oe = 1;  /* Odd mode */
-                ide_write16(ide, r, val);
-            } else if (divide_oe == 1) {
-                divide_oe = 0;
-                divide_pair = val;
-            } else {
-                ide_write16(ide, 0, divide_pair | (val << 8));
-                divide_oe = 0;
-            }
-        }
-        if ((addr & 0xE3) == 0xE3) {
-            /* MAPRAM cannot be cleared */
-            val |= divide_latch & 0x40;
-            divide_latch = val;
-            if (val & 0x80)
-                divide_mapped = 1;
-        }
-        if (divide ==2 && (addr & 0xFF) == 0x17)
-            divplus_ctrl(val);
-    }
+    divide_io_write(&divide_ctx, addr, val);
 }
 
 static unsigned int nbytes;
@@ -1079,6 +930,13 @@ int main(int argc, char *argv[])
     cpu_z80.memWrite = mem_write;
     cpu_z80.trace = z80_trace;
 
+    /* Initialise DivIDE state and context */
+    divide_init(&divide_st);
+    divide_ctx.state     = &divide_st;
+    divide_ctx.ide       = NULL;
+    divide_ctx.get_model = spectrum_get_model;
+    divide_ctx.get_mlatch = spectrum_get_mlatch;
+
     /* Audio beeper */
     if (audio_init_sdl(44100) != 0) {
         fprintf(stderr, "Aviso: audio deshabilitado (SDL_OpenAudioDevice falló).\n");
@@ -1150,20 +1008,9 @@ int main(int argc, char *argv[])
             fprintf(stderr, "ide: attach failed.\n");
             exit(1);
         }
-        fd = open(divpath, O_RDONLY);
-        if (fd == -1) {
-            perror(divpath);
+        if (divide_load_rom(&divide_st, divpath) != 0)
             exit(1);
-        }
-        l = read(fd, divrom, 524288);
-        if (l == 8192)
-            divide = 1;
-        else if (l == 524288)
-            divide = 2;
-        else {
-            fprintf(stderr, "spectrum: divide.rom invalid.\n");
-            exit(1);
-        }
+        divide_ctx.ide = ide;
     }
 
     while (!emulator_done) {

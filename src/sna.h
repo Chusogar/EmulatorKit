@@ -3,7 +3,7 @@
 
 #include <stdint.h>
 #include <stdbool.h>
-#include "libz80/z80.h"
+#include "../libz80/z80.h"
 
 /*
  * Context passed to load_sna() containing all external state it needs.

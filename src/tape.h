@@ -3,7 +3,7 @@
 
 #include <stdint.h>
 #include <stdbool.h>
-#include "libz80/z80.h"
+#include "../libz80/z80.h"
 
 /* T-state clock rate (PAL ~3.5469 MHz; tolerable for 48K too) */
 #define TSTATES_CPU     3546900.0

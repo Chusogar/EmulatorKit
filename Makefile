@@ -327,8 +327,17 @@ microtanic6808: microtanic6808.o ttycon.o 6551.o 6522.o ide.o wd17xx.o 58174.o 6
 sorceror: sorceror.o event_sdl2.o keymatrix.o wd17xx.o drivewire.o ppide.o ide.o z80dis.o libz80/libz80.o
 	cc -g3 sorceror.o event_sdl2.o keymatrix.o wd17xx.o drivewire.o ppide.o ide.o z80dis.o libz80/libz80.o -lm -o sorceror -lSDL2
 
-spectrum: spectrum.o tape.o sna.o tzx.o event_sdl2.o keymatrix.o ide.o z80dis.o lib765/lib/lib765.a libz80/libz80.o
-	cc -g3 spectrum.o tape.o sna.o tzx.o event_sdl2.o keymatrix.o ide.o z80dis.o lib765/lib/lib765.a libz80/libz80.o -lm -o spectrum -lSDL2
+spectrum: spectrum.o src/tape.o src/sna.o src/divide.o tzx.o event_sdl2.o keymatrix.o ide.o z80dis.o lib765/lib/lib765.a libz80/libz80.o
+	cc -g3 spectrum.o src/tape.o src/sna.o src/divide.o tzx.o event_sdl2.o keymatrix.o ide.o z80dis.o lib765/lib/lib765.a libz80/libz80.o -lm -o spectrum -lSDL2
+
+src/tape.o: src/tape.c src/tape.h
+	$(CC) $(CFLAGS) -c src/tape.c -o src/tape.o
+
+src/sna.o: src/sna.c src/sna.h
+	$(CC) $(CFLAGS) -c src/sna.c -o src/sna.o
+
+src/divide.o: src/divide.c src/divide.h
+	$(CC) $(CFLAGS) -c src/divide.c -o src/divide.o
 
 z80all: z80all.o 16x50.o ttycon.o ide.o z80dis.o libz80/libz80.o
 	cc -g3 z80all.o 16x50.o ttycon.o ide.o z80dis.o libz80/libz80.o -lSDL2 -o z80all
