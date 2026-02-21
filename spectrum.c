@@ -60,6 +60,11 @@ static uint32_t texturebits[WIDTH * HEIGHT];
 
 uint8_t border_color   = 7;
 
+static uint8_t border_pixels[HEIGHT][WIDTH];
+static unsigned frame_scanline_idx = 0;
+static uint64_t scanline_tstate_origin = 0;
+#define TSTATES_PER_SCANLINE 224
+
 static uint32_t palette[16] = {
     0xFF000000, 0xFF0000D8, 0xFFD80000, 0xFFD800D8,
     0xFF00D800, 0xFF00D8D8, 0xFFD8D800, 0xFFD8D8D8,
@@ -677,6 +682,21 @@ static void ula_write(uint8_t v)
     beeper_set_from_ula(v);
 
     repaint_border(v & 7);
+
+    /* Mid-line border update */
+    if (frame_scanline_idx < HEIGHT) {
+        int64_t t_offset = (int64_t)cpu_z80.tstates - (int64_t)scanline_tstate_origin;
+        /* Clamp to valid range (negative can occur at start/reset) */
+        if (t_offset < 0) t_offset = 0;
+        if (t_offset > TSTATES_PER_SCANLINE) t_offset = TSTATES_PER_SCANLINE;
+        /* Map 0..TSTATES_PER_SCANLINE -> 0..255 visible pixels, then offset by BORDER */
+        unsigned vis_x = (unsigned)((t_offset * 256) / TSTATES_PER_SCANLINE);
+        int x = BORDER + (int)vis_x;
+        if (x >= (int)WIDTH) x = WIDTH - 1;
+        uint8_t c = v & 7;
+        for (int xx = x; xx < (int)WIDTH; ++xx)
+            border_pixels[frame_scanline_idx][xx] = c;
+    }
 }
 
 static uint8_t ula_read(uint16_t addr)
@@ -933,6 +953,14 @@ static void raster_block(unsigned ybase, unsigned off, unsigned aoff)
 
 static void spectrum_rasterize(void)
 {
+    for (unsigned y = 0; y < HEIGHT; ++y) {
+        uint32_t *p = texturebits + y * WIDTH;
+        for (unsigned x = 0; x < WIDTH; ++x) {
+            uint8_t bc = border_pixels[y][x] & 0x0F;
+            p[x] = palette[bc];
+        }
+    }
+    /* draw visible blocks overwriting the center area */
     raster_block(0, 0x0000, 0x1800);
     raster_block(64, 0x0800, 0x1900);
     raster_block(128, 0x1000, 0x1A00);
@@ -979,6 +1007,14 @@ static void run_scanlines(unsigned lines, unsigned blank)
         drawline = 0;
     /* Run scanlines */
     for (i = 0; i < lines; i++) {
+        /* Initialize border_pixels for this scanline and record T-state origin
+         * for mid-line border change calculations in ula_write() */
+        if (frame_scanline_idx < HEIGHT) {
+            scanline_tstate_origin = cpu_z80.tstates;
+            uint8_t c = border_color & 0x0F;
+            for (unsigned x = 0; x < WIDTH; ++x)
+                border_pixels[frame_scanline_idx][x] = c;
+        }
         /* Delimitamos porciones (beeper + cinta) alrededor de la ejecución */
         beeper_begin_slice();
         tape_begin_slice();
@@ -996,6 +1032,7 @@ static void run_scanlines(unsigned lines, unsigned blank)
 
         if (!blanked)
             drawline++;
+        frame_scanline_idx++;
     }
     if (ui_event())
         emulator_done = 1;
@@ -1683,6 +1720,7 @@ int main(int argc, char *argv[])
                     F8 (play/pause pulses), F9 (rewind pulses) */
         handle_hotkeys(tapepath, tzx_path);
 
+        frame_scanline_idx = 0;
         /* 192 scanlines framebuffer */
         run_scanlines(192, 1);
         /* and border */
