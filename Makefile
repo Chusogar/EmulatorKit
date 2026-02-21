@@ -25,11 +25,15 @@ libz80/libz80.o:
 libz180/libz180.o:
 	$(MAKE) --directory libz180
 
+emu2149/emu2149.o:
+	$(MAKE) --directory emu2149
+
 lib765/lib/lib765.a:
 	$(MAKE) --directory lib765/lib
 
 am9511/libam9511.a:
 	$(MAKE) --directory am9511
+
 
 rc2014:	rc2014.o event_noui.o 16x50.o acia.o z80sio.o ttycon.o vtcon_noui.o amd9511.o ef9345.o ef9345_norender.o gdb-backend-z80.o gdb-server.o ide.o ncr5380.o ppide.o ps2.o ps2event_noui.o rtc_bitbang.o sasi.o sdcard.o sn76489_noui.o tft_dumb.o tft_dumb_norender.o tms9918a.o tms9918a_norender.o w5100.o z80dma.o z180copro.o zxkey_none.o z180_io.o z80dis.o libz80/libz80.o libz180/libz180.o lib765/lib/lib765.a am9511/libam9511.a
 	cc -g3 rc2014.o event_noui.o zxkey_none.o 16x50.o acia.o z80sio.o ttycon.o vtcon_noui.o amd9511.o ef9345.o ef9345_norender.o gdb-backend-z80.o gdb-server.o ide.o ncr5380.o ppide.o ps2.o ps2event_noui.o rtc_bitbang.o sasi.o sdcard.o sn76489_noui.o tft_dumb.o tft_dumb_norender.o tms9918a.o tms9918a_norender.o w5100.o z80dma.o z180copro.o z80dis.o z180_io.o libz80/libz80.o libz180/libz180.o lib765/lib/lib765.a am9511/libam9511.a -lm -o rc2014
@@ -271,11 +275,11 @@ nabupc_sdl2: nabupc.o nabupc_sdlui.o ide.o tms9918a.o tms9918a_sdl2.o z80dis.o l
 z80retro: z80retro.o event_noui.o z80sio.o ttycon.o i2c_bitbang.o i2c_ds1307.o sdcard.o z80dis.o libz80/libz80.o
 	cc -g3 z80retro.o event_noui.o z80sio.o ttycon.o i2c_bitbang.o i2c_ds1307.o sdcard.o z80dis.o libz80/libz80.o -lm -o z80retro
 
-2063: 2063.o event_noui.o 2063_noui.o sdcard.o 16x50.o z80sio.o vtcon_noui.o ttycon.o tms9918a.o tms9918a_norender.o nojoystick.o z80dis.o libz80/libz80.o
-	cc -g3 2063.o event_noui.o 2063_noui.o sdcard.o 16x50.o z80sio.o vtcon_noui.o ttycon.o tms9918a.o tms9918a_norender.o nojoystick.o z80dis.o libz80/libz80.o -lm -o 2063
+2063: 2063.o event_noui.o 2063_noui.o sdcard.o 16x50.o z80sio.o vtcon_noui.o ttycon.o tms9918a.o tms9918a_norender.o nojoystick.o z80dis.o libz80/libz80.o ym2149_noui.o
+	cc -g3 2063.o event_noui.o 2063_noui.o sdcard.o 16x50.o z80sio.o vtcon_noui.o ttycon.o tms9918a.o tms9918a_norender.o nojoystick.o z80dis.o libz80/libz80.o ym2149_noui.o -lm -o 2063
 
-2063_sdl2: 2063.o event_sdl2.o 2063_sdl2.o sdcard.o 16x50.o z80sio.o vtcon_sdl2.o asciikbd_sdl2.o ttycon.o tms9918a.o tms9918a_sdl2.o joystick.o z80dis.o libz80/libz80.o
-	cc -g3 2063.o event_sdl2.o 2063_sdl2.o sdcard.o 16x50.o z80sio.o vtcon_sdl2.o asciikbd_sdl2.o ttycon.o tms9918a.o tms9918a_sdl2.o joystick.o z80dis.o libz80/libz80.o -lm -o 2063_sdl2 -lSDL2
+2063_sdl2: 2063.o event_sdl2.o 2063_sdl2.o sdcard.o 16x50.o z80sio.o vtcon_sdl2.o asciikbd_sdl2.o ttycon.o tms9918a.o tms9918a_sdl2.o joystick.o z80dis.o libz80/libz80.o emu2149/emu2149.o ym2149_sdl2.o
+	cc -g3 2063.o event_sdl2.o 2063_sdl2.o sdcard.o 16x50.o z80sio.o vtcon_sdl2.o asciikbd_sdl2.o ttycon.o tms9918a.o tms9918a_sdl2.o joystick.o z80dis.o libz80/libz80.o emu2149/emu2149.o ym2149_sdl2.o  -lm -o 2063_sdl2 -lSDL2
 
 zeta-v2: zeta-v2.o ide.o ppide.o pprop.o 16x50.o rtc_bitbang.o z80dis.o libz80/libz80.o lib765/lib/lib765.a
 	cc -g3 zeta-v2.o ide.o ppide.o pprop.o 16x50.o rtc_bitbang.o z80dis.o libz80/libz80.o lib765/lib/lib765.a -o zeta-v2
@@ -323,8 +327,8 @@ microtanic6808: microtanic6808.o ttycon.o 6551.o 6522.o ide.o wd17xx.o 58174.o 6
 sorceror: sorceror.o event_sdl2.o keymatrix.o wd17xx.o drivewire.o ppide.o ide.o z80dis.o libz80/libz80.o
 	cc -g3 sorceror.o event_sdl2.o keymatrix.o wd17xx.o drivewire.o ppide.o ide.o z80dis.o libz80/libz80.o -lm -o sorceror -lSDL2
 
-spectrum: spectrum.o event_sdl2.o keymatrix.o ide.o z80dis.o lib765/lib/lib765.a libz80/libz80.o
-	cc -g3 spectrum.o event_sdl2.o keymatrix.o ide.o z80dis.o lib765/lib/lib765.a libz80/libz80.o -lm -o spectrum -lSDL2
+spectrum: spectrum.o tzx.o event_sdl2.o keymatrix.o ide.o z80dis.o lib765/lib/lib765.a libz80/libz80.o
+	cc -g3 spectrum.o tzx.o event_sdl2.o keymatrix.o ide.o z80dis.o lib765/lib/lib765.a libz80/libz80.o -lm -o spectrum -lSDL2
 
 z80all: z80all.o 16x50.o ttycon.o ide.o z80dis.o libz80/libz80.o
 	cc -g3 z80all.o 16x50.o ttycon.o ide.o z80dis.o libz80/libz80.o -lSDL2 -o z80all
@@ -347,6 +351,7 @@ clean:
 	$(MAKE) --directory m68k clean && \
 	$(MAKE) --directory am9511 clean && \
 	$(MAKE) --directory ns32k clean && \
+	$(MAKE) --directory emu2149 clean && \
 	rm -f *.o *~ $(BINS) $(SDL2_BINS)
 
 SRCS := $(subst ./,,$(shell find . -name '*.c'))

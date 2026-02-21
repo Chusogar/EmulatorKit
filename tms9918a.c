@@ -66,24 +66,27 @@ static void tms9918a_render_slice(struct tms9918a *vdp, int y, uint8_t *sprat, u
 	xmax = x+width;
 
 	if (xmax >= 256) xmax = 256;
-	/* Walk across the sprite doing rendering and collisions. Collisions apply
-	   to offscreen objects. Colbuf is sized to cover this */
+	/* Walk across the sprite doing rendering and collisions.
+	 * - Collisions offscreen are ignored
+	 * - Only opaque pixels are considered.
+	 *   NOTE: This is in direct contrast to the TMS9918A Datasheet.
+	 */
 	for (i = x; i < xmax; i++) {
 		if (i >= 0 && i <= 255) {
-			if (bits & 0x8000U)
+			if (bits & 0x8000U) {
 				vdp->rasterbuffer[256*y+i] = foreground;
-		}
-		/* This pixel was already sprite written - collision */
-		if (*colptr) {
-			vdp->status |= 0x20;
-			*colptr++ = 1;
-		} else {
-			colptr++;
+				if (*colptr) {
+					vdp->status |= 0x20;
+				} else {
+					*colptr = 1;
+				}
+			}
 		}
 		/* For magnified sprites write each pixel twice */
 		step ^= mag;
 		if (step == 1)
 			bits <<= 1;
+		colptr ++;
 	}
 }
 
@@ -109,7 +112,7 @@ static void tms9918a_render_sprite(struct tms9918a *vdp, int y, uint8_t *sprat, 
 	if ((vdp->reg[1] & 0x02) == 0) {
 		spdat += row;
 		width = 8;
-		bits = *spdat << 24;
+		bits = *spdat << 8;
 	} else {
 		spdat += row;
 		bits = *spdat << 8;
@@ -161,7 +164,8 @@ static void tms9918a_sprite_line(struct tms9918a *vdp, int y)
 		/* Too many sprites: only 4 get handled */
 		/* Q: do the full 32 get collision detected ? */
 		if (ns > 4) {
-			vdp->status |= 0x40 | i;	/* Too many sprites */
+			if ((vdp->status & 0x40) == 0)
+				vdp->status |= 0x40 | i;	/* Too many sprites */
 			break;
 		}
 		*spqueue++ = sprat;

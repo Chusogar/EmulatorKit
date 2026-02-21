@@ -78,6 +78,8 @@ static uint8_t bank512 = 0;
 static uint8_t switchrom = 1;
 static uint32_t romsize = 65536;
 static uint8_t extreme;
+static uint8_t sc737_bits;			/* 50Hz timer card */
+static uint8_t sc737_ctrl;
 
 #define CPUBOARD_Z80		0		/* Standard setup */
 #define CPUBOARD_SC108		1		/* Like paged but 0x38 bit 7 controls RAM A16 */
@@ -112,6 +114,7 @@ static uint8_t have_tms;
 static uint8_t have_ef9345;
 static uint8_t have_kio_ext;	/* Extreme config KIO at C0-DF */
 static uint8_t have_busstop;
+static uint8_t have_sc737;
 
 static uint8_t port30 = 0;
 static uint8_t port38 = 0;
@@ -161,6 +164,7 @@ static uint8_t live_nonim2;
 #define IRQM_VDP	1
 #define IRQM_ACIA	2
 #define IRQM_16X50	4
+#define IRQM_SC737	8
 
 static Z80Context cpu_z80;
 static struct gdb_server *gdb;
@@ -1992,6 +1996,34 @@ static void propgfx_write(unsigned cmd, uint8_t data)
 	fprintf(stderr, "D%02X ", data);
 }
 
+static uint8_t sc737_read(void)
+{
+	return sc737_bits | 0x78;
+}
+
+static void sc737_write(uint8_t r)
+{
+	/* Write low then high clears the interrupt (sets bit 7) */
+	if ((r & 0x80) && !(sc737_ctrl & 0x80))
+		sc737_bits |= 0x80;
+	sc737_ctrl = r;
+}
+
+static unsigned sc737_irq(void)
+{
+	/* If irq pending and irq enabled */
+	if (!(sc737_bits & 0x80) && (sc737_ctrl & 0x80))
+		return 1;
+	return 0;
+}
+
+static void sc737_tick(void)
+{
+	/* Roll low bits for count, clear bit 7 */
+	sc737_bits++;
+	sc737_bits &= 0x03;
+}
+
 static uint8_t sio_port[4] = {
 	SIOA_C,
 	SIOA_D,
@@ -2019,6 +2051,8 @@ static uint8_t io_read_2014(uint16_t addr)
 	}
 	addr &= 0xFF;
 
+	if (addr == 0x0F && have_sc737)
+		return sc737_read();
 	if (addr >= 0x80 && addr <= 0x9F && have_kio)
 		return kio_read(addr & 0x1F);
 	if (addr >= 0x48 && addr < 0x50)
@@ -2113,7 +2147,10 @@ static void io_write_2014(uint16_t addr, uint8_t val, uint8_t known)
 		return;
 	}
 	addr &= 0xFF;
-	if (addr >= 0x80 && addr <= 0x9F && have_kio)
+	if (addr == 0x0F && have_sc737) {
+		sc737_write(val);
+		poll_irq_nonim2();
+	} else if (addr >= 0x80 && addr <= 0x9F && have_kio)
 		kio_write(addr & 0x1F, val);
 	else if (addr == 0x44 && ef9345 && !extreme)
 		ef_latch = val;
@@ -2744,6 +2781,8 @@ static void poll_irq_nonim2(void)
 		live_nonim2 |= IRQM_16X50;
 	if (vdp && tms9918a_irq_pending(vdp))
 		live_nonim2 |= IRQM_VDP;
+	if (have_sc737 && sc737_irq())
+		live_nonim2 |= IRQM_SC737;
 	set_interrupt();
 }
 
@@ -2865,7 +2904,7 @@ int main(int argc, char *argv[])
 	while (p < ramrom + sizeof(ramrom))
 		*p++= rand();
 
-	while ((opt = getopt(argc, argv, "179Aabcd:e:EfF:G:i:I:km:nN:pPr:sRS:Tuw8CZz:XS")) != -1) {
+	while ((opt = getopt(argc, argv, "1579Aabcd:e:EfF:G:i:I:km:nN:pPr:sRS:Tuw8CZz:XS")) != -1) {
 		switch (opt) {
 		case 'a':
 			have_acia = 1;
@@ -3144,6 +3183,10 @@ int main(int argc, char *argv[])
 		case 'X':
 			extreme = 1;
 			have_kio_ext = 1;
+			break;
+		case '5':
+			have_sc737 = 1;
+			printf("sc737 enable\n");
 			break;
 		case '7':
 			have_sn = 1;
@@ -3576,6 +3619,8 @@ int main(int argc, char *argv[])
 		}
 		if (have_wiznet)
 			w5100_process(wiz);
+		if (have_sc737)
+			sc737_tick();
 		/* Do 20ms of I/O and delays */
 		if (!fast)
 			nanosleep(&tc, NULL);

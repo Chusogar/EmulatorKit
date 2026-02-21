@@ -1,0 +1,93 @@
+ESXDOS v0.8.0
+(c) 2005-2012 Papaya Dezign
+---------------------------
+
+Changelog
+---------
+
+[03/04/2012] Commands: Added playpt3, playstc and playsqt .commands (coded by gasman)
+[04/04/2012] BASIC: BASIC commands are now loaded on demand from ESXDOS.SYS; this reduces overall memory usage on system page and enables a greater amount of commands which can be larger in size and complexity
+[04/04/2012] BASIC: Added VERIFY command (requested by velesoft)
+[05/04/2012] NMI: Created NMI handler; loads and executes NMI.SYS (if present) from system drive, saves/restores z80/AY regs, ram size (16k/48k/128k) and RAM bank paged @ $c000 (based on code from velesoft and ub880d)
+[06/04/2012] Commands: Changed .commands dir to /BIN
+[06/04/2012] System Files: Changed default dir for ESXDOS.SYS and NMI.SYS to /SYS
+[06/04/2012] System Files/Basic: BASIC commands (and other parts of the kernel) are now loaded as needed from .KO (Kernel Object) files. These files are located in /SYS dir (filename lookup routine and idea by ub880d)
+[07/04/2012] FAT Driver: Added telldir(), seekdir() and rewinddir() system calls
+[07/04/2012] Kernel: Added syscall to execute .command directly from machine code (requested by ub880d)
+[07/04/2012] Kernel: A="$" refers to boot/system drive (for machine code calls only)
+[08/04/2012] Tape Emulator: Added syscall to do a fast-reset followed by LOAD "" (auto-LOAD)
+[08/04/2012] Commands: Bumped .tapein to v0.1.1 (added -a switch to auto-LOAD after .tap insertion)
+[09/04/2012] Kernel: Converted Tape Emulator to a Kernel Object (TAPE.KO)
+[09/04/2012] Kernel: Added error message when failing to load a .KO - "Loading .KO FAILED"
+[09/04/2012] Kernel: Converted error message table to a Kernel Object (ERRMSG.KO). If loading this file fails for any reason, a generic error message is displayed - "ESXDOS error #??"
+[09/04/2012] NMI: NMI handler was storing incorrect ram size in some circumstances
+[09/04/2012] NMI: Created sample NMI.SYS that saves 48/128k .SNA snapshot (source code included as example)
+[09/04/2012] BIOS: Added "Loading ESXDOS.SYS... " + "[OK]" | "[ERROR]" message at startup
+[09/04/2012] Commands: .snapload patched - 48k lock fix, R register correction and +2A/+3 ROM paging fix (all fixes by velesoft)
+[09/04/2012] NMI: Fixed bug when restoring AY regs + forgot to restore correct DivIDE RAM bank on exit
+[09/04/2012] BIOS: Removed old BIOS print routine, now we call 48K ROM to save space in DivIDE EEPROM
+[09/04/2012] FAT Driver: Volume names with spaces would only get parsed till the first space character
+[09/04/2012] FAT Driver: Empty volume names are now defined as "UNNAMED"
+[10/04/2012] FAT Driver: ESXDOS now always tries to update both copies of the FAT (if only one fails it will continue without failing). When reading the FAT it tries to read the 1st copy, in case of error it tries the 2nd, else it returns with error
+[10/04/2012] FAT Driver: Added preliminary FAT write cache, should speed up most write operations
+[10/04/2012] FAT Driver: ESXDOS now reads (unless the volume is marked dirty) and updates FAT32 FSINFO sector. This speeds up free size calculation and cluster allocation, especially when accessing big/near-full volumes
+[10/04/2012] FAT Driver: *** Please lookout for bugs/corruption due to last 3 changes (update both FATs, write cache and FSINFO) ***
+[10/04/2012] FAT Driver: Added getfree() syscall to get free volume space. This can take quite some time the first time it is run on large FAT16 volumes, due to missing FSINFO sector on FAT16. Subsequent calls are cached and are as fast as on FAT32
+[10/04/2012] FAT Driver: Fixed bug that could corrupt the FAT (on a very rare and specific condition)
+[10/04/2012] BASIC: CAT <drive> now displays item count and free space on drive (on FAT16 this can take a while, read above)
+[11/04/2012] Kernel: Fixed DISK_INFO syscall when A=device (reported by ub880d)
+[11/04/2012] FAT Driver: Fixed ESXDOS still mounting FAT12 volumes, even though support code was removed from v0.7.0 upwards
+[12/04/2012] FAT Driver: Fixed multiple issues when trying to write/delete on a full (or near-full) drive
+[12/04/2012] FAT Driver: ESXDOS now gets the actual number of entries in FAT16 root dir from the BPB, instead of assuming that it's always 512
+[12/04/2012] FAT Driver: Added stat() and rmdir() syscalls
+[12/04/2012] BASIC: ERASE now supports deleting empty directories
+[13/04/2012] FAT Driver: Added mkdir() syscall
+[13/04/2012] Commands: Added mkdir .command
+[13/04/2012] FAT Driver: Enabled access to current working directory (".") from root dir (reported by ub880d)
+[14/04/2012] FAT Driver: Added truncate() and ftruncate() syscalls
+[14/04/2012] FAT Driver: Fixed a bug where rmdir() would allow you to delete "." dir entry in some cases
+[14/04/2012] FAT Driver: opendir() wasn't setting file handle properly, thus you could delete a directory with an open file handle
+[14/04/2012] BIOS: When opening a .command, any error condition would trigger message "No such COMMAND". Now only ENOENT does.
+[14/04/2012] FAT Driver: Fixed a bug on FAT32 when loading files with length aligned to sector size (reported by ub880d)
+[14/04/2012] FAT Driver: seekdir() and rewinddir() weren't actually working due to a bug in opendir (reported by ub880d)
+[14/04/2012] NMI: Fixed bug when invoking .snapload with some snapshots (reported by ub880d)
+[14/04/2012] Tape Emulator: Fixed auto-LOAD issue with some .TAPs (reported by ub880d)
+[15/04/2012] FAT Driver: Added chmod() syscall
+[15/04/2012] Commands: Added chmod .command
+[15/04/2012] FAT Driver: mkdir() wasn't correctly setting parent direntry (reported by ub880d)
+[15/04/2012] NMI: Added ub880d's work-in-progress file browser (NMI.SYS), featuring screen viewer, tape selection/auto-LOAD and snapshot loading (screen backup/restore is not done yet)
+[15/04/2012] NMI: NMI.SYS is now loaded at startup
+[16/04/2012] NMI: Added some syscalls that enable up to 7K of Speccy RAM (ie screen) to be saved/restored to DivIDE RAM (only works if MAPRAM mode is not active)
+[17/04/2012] FAT Driver: Chars above 127 in a filename were (incorrectly) being deemed invalid (reported by velesoft and ub880d)
+[17/04/2012] NMI: Fixed bugs related to the MAPRAM syscalls (reported by ub880d)
+[18/04/2012] NMI: ub880d's browser now backups speccy screen to ram or disk depending on if MAPRAM is active or not
+[18/04/2012] FAT Driver: Added rename() syscall
+[18/04/2012] Commands: Added mv .command
+[18/04/2012] Commands: Added improved cp .command, with variable buffer size (4/8/16/32Kb) and ability to do .cp file dir/ (like .mv command)
+[18/04/2012] FAT Driver: Fixed regression in open() that depending on open mode could create corrupt files
+[19/04/2012] FAT Driver: trunc_length routine had a bug that corrupted read/writes in some cases (fixed and improved by ub880d)
+[19/04/2012] FAT Driver: rename() will now reuse direntry slot if source and target are in same directory
+[19/04/2012] Tape Emulator: Added syscall to set virtual tape position
+[19/04/2012] Commands: .tapein has 2 new options: -s to set virtual tape position and -r to rewind virtual tape to beginning
+[21/04/2012] Kernel: auto-LOAD routine is now more compatible and can load BASIC programs not only from (emulated) tape but also from disk
+[21/04/2012] Kernel: Added new syscall for auto-LOAD (removed old tape-only one)
+[21/04/2012] NMI: Fixed crashes when pressing NMI without NMI.SYS and/or ESXDOS.SYS present (reported by velesoft)
+[21/04/2012] BIOS: Disabled trying to load NMI.SYS if ESXDOS.SYS wasn't loaded correctly as it was pointless
+[21/04/2012] NMI: ub880d's NMI.SYS can now auto-LOAD disk files and display SCREEN$ files that have a header
+[22/04/2012] Kernel: Fixed some regressions when handling error messages without system file loaded
+[22/04/2012] NMI: NMI.SYS can now save 48/128 .SNA snapshots
+[23/04/2012] NMI: 128K RAM bank wasn't always set correctly and stack pointer wasn't being corrected for 128K snapshots
+[23/04/2012] BIOS: Added cut-down version of K-0s' "official" ESXDOS logo to the boot screen (by bracket/AccessioN)
+
+Known Bugs
+----------
+
+BASIC/Tape Emulator: You can overwrite ESXDOS system using LOAD CODE that crosses $2000
+Commands: Proper argument/syntax checking is not done yet on most commands
+Commands/BASIC: No wildcards yet
+FAT Driver: +3DOS header is set on file creation and never updated when file size changes
+FAT Driver: rename() isn't even remotely posix compliant
+FAT Driver: Directories read-only attribute isn't always respected
+BIOS: Version of system file isn't checked against the ROM version (bad things will happen if there's a mismatch)
+
+23.04.2012 / Papaya Dezign - All rights perversed

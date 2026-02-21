@@ -38,7 +38,7 @@ static SDL_Texture *texture;
 
 static uint32_t texturebits[ROWS * COLS * CWIDTH * CHEIGHT];
 
-static uint8_t ram[131072];
+static uint8_t ram[512 * 1024];	/* Newer Z80ALL is 512K */
 static uint8_t vram[4096];
 static uint8_t banklatch = 3;
 
@@ -256,7 +256,7 @@ void io_write(int unused, uint16_t addr, uint8_t val)
 	case 0x1F:		/* Memory control */
 		if (val & 0x80)
 			rom_mapped = 0;
-		banklatch = val & 3;
+		banklatch = val & bankmask;
 		return;
 	case 0xF5:		/* PS/2 status/command */
 		/* TODO: confusing description */
@@ -437,7 +437,7 @@ static void exit_cleanup(void)
 
 static void usage(void)
 {
-	fprintf(stderr, "z80all: [-f] [-i idepath] [-d debug]\n");
+	fprintf(stderr, "z80all: [-5] [-f] [-i idepath] [-d debug]\n");
 	exit(EXIT_FAILURE);
 }
 
@@ -451,7 +451,7 @@ int main(int argc, char *argv[])
 	while (p < ram + sizeof(ram))
 		*p++ = rand();
 
-	while ((opt = getopt(argc, argv, "d:fi:")) != -1) {
+	while ((opt = getopt(argc, argv, "5d:fi:")) != -1) {
 		switch (opt) {
 		case 'i':
 			idepath = optarg;
@@ -462,6 +462,11 @@ int main(int argc, char *argv[])
 			break;
 		case 'f':
 			fast = 1;
+			break;
+		case '5':
+			/* Support 512K later version that is ROMWBW
+			   capable */
+			banklatch = bankmask = 15;
 			break;
 		default:
 			usage();
@@ -505,22 +510,22 @@ int main(int argc, char *argv[])
 
 	atexit(SDL_Quit);
 	if (SDL_Init(SDL_INIT_EVERYTHING) < 0) {
-		fprintf(stderr, "sorceror: unable to initialize SDL: %s\n", SDL_GetError());
+		fprintf(stderr, "z80all: unable to initialize SDL: %s\n", SDL_GetError());
 		exit(1);
 	}
 	window = SDL_CreateWindow("Z80ALL", SDL_WINDOWPOS_UNDEFINED, SDL_WINDOWPOS_UNDEFINED, COLS * CWIDTH, ROWS * CHEIGHT, SDL_WINDOW_RESIZABLE);
 	if (window == NULL) {
-		fprintf(stderr, "sorceror: unable to open window: %s\n", SDL_GetError());
+		fprintf(stderr, "z80all: unable to open window: %s\n", SDL_GetError());
 		exit(1);
 	}
 	render = SDL_CreateRenderer(window, -1, 0);
 	if (render == NULL) {
-		fprintf(stderr, "sorceror: unable to create renderer: %s\n", SDL_GetError());
+		fprintf(stderr, "z80all: unable to create renderer: %s\n", SDL_GetError());
 		exit(1);
 	}
 	texture = SDL_CreateTexture(render, SDL_PIXELFORMAT_ARGB8888, SDL_TEXTUREACCESS_STREAMING, COLS * CWIDTH, ROWS * CHEIGHT);
 	if (texture == NULL) {
-		fprintf(stderr, "sorceror: unable to create texture: %s\n", SDL_GetError());
+		fprintf(stderr, "z80all: unable to create texture: %s\n", SDL_GetError());
 		exit(1);
 	}
 	SDL_SetRenderDrawColor(render, 0, 0, 0, 255);

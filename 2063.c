@@ -9,6 +9,7 @@
  *	SIO at 0x30
  *	CTC at 0x40
  *	Flash disable at 0x70
+ *	NOUVEAU: AYREG at 0xB0, AYDATA at 0xB1
  *
  *	Bitbang SD
  *
@@ -34,6 +35,7 @@
 #include "ttycon.h"
 #include "vtcon.h"
 #include "16x50.h"
+#include "ym2149.h"
 #include "z80sio.h"
 #include "sdcard.h"
 #include "system.h"
@@ -52,6 +54,8 @@ static uint8_t gpio_in = 0xFF;		/* SD not present, printer floating */
 static uint8_t flash_in = 1;
 static struct sdcard *sdcard;
 static struct tms9918a *vdp;
+static struct ym2149 *sn;
+static uint8_t psg_reg = 0xFF; 		/* need to capture the reg and send it with the data to PSG_writeReg */
 static struct tms9918a_renderer *vdprend;
 static struct uart16x50 *uart;
 static struct z80_sio *sio;
@@ -90,6 +94,9 @@ volatile int emulator_done;
 #define TRACE_TMS9918A	0x000800
 #define TRACE_JOY	0x001000
 #define TRACE_UART	0x002000
+
+
+#define AY_CLK          1789773
 
 static int trace = 0;
 
@@ -502,7 +509,7 @@ void io_write(int unused, uint16_t addr, uint8_t val)
 	if (trace & TRACE_IO)
 		fprintf(stderr, "write %02x <- %02x\n", addr, val);
 	addr &= 0xFF;
-	switch(addr & 0xF0) {
+	switch(addr& 0xF0) {
 	case 0x10:
 		gpio_write(addr, val);
 		return;
@@ -527,6 +534,17 @@ void io_write(int unused, uint16_t addr, uint8_t val)
 			return;
 		}
 		break;
+	case 0xB0:
+		if (sn) {
+			if ((addr & 1) == 0) {
+				psg_reg = val;
+				return;
+			} else if ((addr & 1) == 1) {
+				ym2149_write(sn, psg_reg, val);
+				return;
+			}
+		}
+		break;
 	}
 	if (addr == 0xFD) {
 		trace &= 0xFF00;
@@ -542,7 +560,7 @@ void io_write(int unused, uint16_t addr, uint8_t val)
 
 static void poll_irq_event(void)
 {
-	unsigned v;
+	int v;
 
 	if (live_irq)
 		return;
@@ -590,6 +608,7 @@ static void cleanup(int sig)
 static void exit_cleanup(void)
 {
 	tcsetattr(0, TCSADRAIN, &saved_term);
+	ym2149_destroy(sn);
 }
 
 static void usage(void)
@@ -699,7 +718,9 @@ int main(int argc, char *argv[])
 
 	/* 60Hz for the VDP */
 	tc.tv_sec = 0;
-	tc.tv_nsec = 16666667L;
+	tc.tv_nsec = 16666667L/2;
+
+        sn = ym2149_create((uint16_t)AY_CLK);
 
 	if (tcgetattr(0, &term) == 0) {
 		saved_term = term;
@@ -753,11 +774,11 @@ int main(int argc, char *argv[])
 				emulator_done = 1;
 		}
 
-		/* Do 20ms of I/O and delays */
 		if (vdp) {
 			tms9918a_rasterize(vdp);
 			tms9918a_render(vdprend);
 		}
+		/* Do 20ms of I/O and delays */
 		if (!fast)
 			nanosleep(&tc, NULL);
 		/* If there is no pending Z80 vector IRQ but we think
@@ -766,5 +787,6 @@ int main(int argc, char *argv[])
 		if (!live_irq)
 			poll_irq_event();
 	}
+
 	exit(0);
 }

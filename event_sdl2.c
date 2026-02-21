@@ -48,6 +48,10 @@ unsigned ui_event(void)
 	SDL_Event ev;
 	while (SDL_PollEvent(&ev)) {
 		switch(ev.type) {
+		case SDL_WINDOWEVENT:
+			if (ev.window.event == SDL_WINDOWEVENT_CLOSE)
+				return 1;
+			break;
 		case SDL_QUIT:
 			return 1;
 		}

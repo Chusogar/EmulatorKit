@@ -95,7 +95,7 @@ static int sio_check_im2_chan(struct z80_sio_chan *chan)
 		if (sio->chan[1].wr[1] & 0x04) {
 			vector &= 0xF1;
 			/* TODO: external status change */
-			if (chan->unit == 0)
+			if (chan->unit == 'a')
 				vector |= 8;
 			if (chan->intbits & INT_RX)
 				vector |= 4;
