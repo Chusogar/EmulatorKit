@@ -43,6 +43,8 @@
 #include "ide.h"
 #include "lib765/include/765.h"
 #include "tzx.h"
+#include "tape.h"
+#include "sna.h"
 
 #include <SDL2/SDL.h>
 #include "event.h"
@@ -128,7 +130,7 @@ static void reti_event(void);
 /* ─────────────────────────────────────────────────────────────
  * Beeper (EAR/MIC) + SDL2 audio queue (mono, S16)
  * ───────────────────────────────────────────────────────────── */
-#define TSTATES_CPU 3546900.0 /* PAL 128K ~3.5469 MHz; 48K ~3.5 MHz, diferencia tolerable */
+/* TSTATES_CPU is defined in tape.h */
 
 static SDL_AudioDeviceID audio_dev = 0;
 static SDL_AudioSpec have;
@@ -451,48 +453,8 @@ static void fdc_log(int debuglevel, char *fmt, va_list ap)
 }
 
 /* ─────────────────────────────────────────────────────────────
- * TAP por pulsos (ROM estándar) - Motor de cinta
+ * TAP pulse player instance (types/functions in tape.c / tape.h)
  * ───────────────────────────────────────────────────────────── */
-#define T_PILOT        2168
-#define T_SYNC1         667
-#define T_SYNC2         735
-#define T_BIT0          855
-#define T_BIT1         1710
-#define PILOT_HDR     8063
-#define PILOT_DATA    3223
-#define T_PAUSE_MS    1000
-#define T_MS(ms)      ((uint64_t)((ms) * (TSTATES_CPU / 1000.0)))
-
-typedef struct {
-    uint16_t len;      /* bytes: flag + payload + checksum */
-    uint8_t *data;
-} tap_block_t;
-
-typedef enum {
-    TP_IDLE = 0, TP_PILOT, TP_SYNC1, TP_SYNC2, TP_BITS,
-    TP_PAUSE, TP_NEXTBLOCK, TP_DONE
-} tape_phase_t;
-
-typedef struct {
-    tap_block_t *blk;
-    int nblk;
-
-    int i_blk;
-    int i_byte;
-    int bit_mask;
-    int subpulse;
-
-    tape_phase_t phase;
-    uint64_t next_edge_at;
-    uint64_t pause_end_at;
-    int pilot_left;
-
-    int ear_level;            /* 0/1: señal en la entrada EAR */
-    uint64_t frame_origin;
-    uint64_t slice_origin;
-    int playing;              /* 1=PLAY, 0=PAUSE */
-} tape_player_t;
-
 static tape_player_t tape = {0};
 
 /* ─────────────────────────────────────────────────────────────
@@ -500,169 +462,6 @@ static tape_player_t tape = {0};
  * ───────────────────────────────────────────────────────────── */
 static tzx_player_t *tzx_player = NULL;
 static uint64_t      tzx_frame_origin = 0;
-
-static inline int tape_active(void) { return tape.playing && tape.phase != TP_DONE; }
-static inline uint8_t tape_ear_bit6(void) { return (tape_active() && tape.ear_level) ? 0x40 : 0x00; }
-
-/* Pequeño lector LE16 local para TAP pulses */
-static inline uint16_t tape_rd_le16(FILE* f)
-{
-    int lo = fgetc(f), hi = fgetc(f);
-    if (lo == EOF || hi == EOF) return 0;
-    return (uint16_t)(lo | (hi << 8));
-}
-
-static void tape_free(void)
-{
-    if (tape.blk) {
-        for (int i = 0; i < tape.nblk; ++i) free(tape.blk[i].data);
-        free(tape.blk);
-        tape.blk = NULL; tape.nblk = 0;
-    }
-}
-
-/* Carga TAP en memoria para reproducción por pulsos (ROM estándar) */
-static int tape_load_tap_pulses(const char* path)
-{
-    FILE* f = fopen(path, "rb");
-    if (!f) { perror(path); return -1; }
-
-    tape_free();
-
-    int count = 0;
-    while (1) {
-        uint16_t blen = tape_rd_le16(f);
-        if (feof(f)) break;
-        if (blen == 0 && ferror(f)) { perror("[TAP]"); fclose(f); return -1; }
-        fseek(f, blen, SEEK_CUR);
-        count++;
-    }
-    if (count == 0) { fclose(f); fprintf(stderr, "[TAP] vacío.\n"); return -1; }
-
-    tape.blk = (tap_block_t*)calloc(count, sizeof(tap_block_t));
-    tape.nblk = count;
-
-    fseek(f, 0, SEEK_SET);
-    for (int i = 0; i < count; ++i) {
-        uint16_t blen = tape_rd_le16(f);
-        uint8_t* buf = (uint8_t*)malloc(blen);
-        if (!buf || fread(buf, 1, blen, f) != blen) {
-            fclose(f); tape_free(); return -1;
-        }
-        tape.blk[i].len  = blen;
-        tape.blk[i].data = buf;
-    }
-    fclose(f);
-
-    tape.i_blk = 0; tape.i_byte = 0; tape.bit_mask = 0x80; tape.subpulse = 0;
-    tape.phase = TP_NEXTBLOCK; tape.ear_level = 1;
-    tape.frame_origin = tape.slice_origin = 0;
-    tape.next_edge_at = 0; tape.pause_end_at = 0;
-    tape.playing = 1;
-    fprintf(stdout, "TAP (pulsos) cargado: %s (%d bloques)\n", path, tape.nblk);
-    return 0;
-}
-
-static inline void tape_begin_slice(void)
-{
-    tape.slice_origin = tape.frame_origin;
-}
-
-static void tape_advance_to(uint64_t t_now)
-{
-    if (!tape_active()) return;
-
-    while (1) {
-        switch (tape.phase) {
-        case TP_NEXTBLOCK: {
-            if (tape.i_blk >= tape.nblk) { tape.phase = TP_DONE; return; }
-            uint8_t flag = tape.blk[tape.i_blk].data[0];
-            tape.pilot_left = (flag == 0x00) ? PILOT_HDR : PILOT_DATA;
-            tape.phase = TP_PILOT;
-            tape.next_edge_at = t_now + T_PILOT;
-            tape.ear_level ^= 1;
-            tape.i_byte = 0; tape.bit_mask = 0x80; tape.subpulse = 0;
-            break;
-        }
-        case TP_PILOT:
-            if (t_now < tape.next_edge_at) return;
-            tape.ear_level ^= 1;
-            if (--tape.pilot_left > 0) {
-                tape.next_edge_at += T_PILOT;
-            } else {
-                tape.phase = TP_SYNC1;
-                tape.next_edge_at += T_SYNC1;
-            }
-            break;
-
-        case TP_SYNC1:
-            if (t_now < tape.next_edge_at) return;
-            tape.ear_level ^= 1;
-            tape.phase = TP_SYNC2;
-            tape.next_edge_at += T_SYNC2;
-            break;
-
-        case TP_SYNC2:
-            if (t_now < tape.next_edge_at) return;
-            tape.ear_level ^= 1;
-            tape.phase = TP_BITS;
-            tape.i_byte = 0; tape.bit_mask = 0x80; tape.subpulse = 0;
-            {
-                uint8_t b = tape.blk[tape.i_blk].data[tape.i_byte];
-                int bit = (b & tape.bit_mask) ? 1 : 0;
-                tape.next_edge_at += bit ? T_BIT1 : T_BIT0;
-            }
-            break;
-
-        case TP_BITS: {
-            if (t_now < tape.next_edge_at) return;
-            tape.ear_level ^= 1;
-            uint8_t b = tape.blk[tape.i_blk].data[tape.i_byte];
-            int bit = (b & tape.bit_mask) ? 1 : 0;
-            int tlen = bit ? T_BIT1 : T_BIT0;
-
-            if (tape.subpulse == 0) {
-                tape.subpulse = 1;
-                tape.next_edge_at += tlen;
-            } else {
-                tape.subpulse = 0;
-                if (tape.bit_mask == 0x01) {
-                    tape.bit_mask = 0x80;
-                    tape.i_byte++;
-                } else {
-                    tape.bit_mask >>= 1;
-                }
-                if (tape.i_byte >= tape.blk[tape.i_blk].len) {
-                    tape.phase = TP_PAUSE;
-                    tape.pause_end_at = t_now + T_MS(T_PAUSE_MS);
-                } else {
-                    b = tape.blk[tape.i_blk].data[tape.i_byte];
-                    bit = (b & tape.bit_mask) ? 1 : 0;
-                    tlen = bit ? T_BIT1 : T_BIT0;
-                    tape.next_edge_at += tlen;
-                }
-            }
-            break;
-        }
-
-        case TP_PAUSE:
-            if (t_now < tape.pause_end_at) return;
-            tape.i_blk++;
-            tape.phase = TP_NEXTBLOCK;
-            break;
-
-        default:
-            return;
-        }
-    }
-}
-
-static inline void tape_end_slice(void)
-{
-    uint64_t t_now = tape.slice_origin + (uint64_t)cpu_z80.tstates;
-    tape_advance_to(t_now);
-    tape.frame_origin = t_now;
-}
 
 /* ─────────────────────────────────────────────────────────────
  * ULA I/O
@@ -687,8 +486,8 @@ static uint8_t ula_read(uint16_t addr)
        - Si la cinta por pulsos está activa, domina la línea
        - Si no, conserva tu comportamiento previo para Issue 3/48K_2 */
     uint8_t ear_b6 = 0x00;
-    if (tape_active()) {
-        ear_b6 = tape_ear_bit6();
+    if (tape_active(&tape)) {
+        ear_b6 = tape_ear_bit6(&tape);
     } else if (tzx_active(tzx_player)) {
         ear_b6 = tzx_ear_bit6(tzx_player);
     } else if (model != ZX_PLUS3) {
@@ -981,7 +780,7 @@ static void run_scanlines(unsigned lines, unsigned blank)
     for (i = 0; i < lines; i++) {
         /* Delimitamos porciones (beeper + cinta) alrededor de la ejecución */
         beeper_begin_slice();
-        tape_begin_slice();
+        tape_begin_slice(&tape);
         if (tzx_player) {
             tzx_begin_slice(tzx_player, tzx_frame_origin);
         }
@@ -989,7 +788,7 @@ static void run_scanlines(unsigned lines, unsigned blank)
         n = 224 + 224 - Z80ExecuteTStates(&cpu_z80, n);
 
         beeper_end_slice();
-        tape_end_slice();
+        tape_end_slice(&tape, &cpu_z80);
         if (tzx_player) {
             tzx_end_slice(tzx_player, &cpu_z80, &tzx_frame_origin);
         }
@@ -1011,326 +810,6 @@ static void run_scanlines(unsigned lines, unsigned blank)
         if (!(cpu_z80.IFF1 | cpu_z80.IFF2))
             int_recalc = 0;
     }
-}
-
-/* ─────────────────────────────────────────────────────────────
- * SNA loader (48K & 128K)
- * 48K: PC se toma de la pila (RETN implícito) y SP += 2.
- * 128K: PC explícito tras 48K; 7FFD y bancos restantes.
- * Refs: Sinclair Wiki / Claus Jahn
- * ───────────────────────────────────────────────────────────── */
-bool load_sna(const char* filename)
-{
-    FILE* f = fopen(filename, "rb");
-    if (!f) {
-        fprintf(stderr, "No se pudo abrir .sna: %s\n", filename);
-        return false;
-    }
-
-    fseek(f, 0, SEEK_END);
-    long fsz = ftell(f);
-    fseek(f, 0, SEEK_SET);
-
-    uint8_t header[27];
-    if (fread(header, 1, 27, f) != 27) {
-        fclose(f);
-        fprintf(stderr, "Archivo .sna incompleto (header)\n");
-        return false;
-    }
-
-    /* Registros (layout 48K) */
-    cpu_z80.I          = header[0];
-    cpu_z80.R2.wr.HL   = (header[2]  << 8) | header[1];
-    cpu_z80.R2.wr.DE   = (header[4]  << 8) | header[3];
-    cpu_z80.R2.wr.BC   = (header[6]  << 8) | header[5];
-    cpu_z80.R2.wr.AF   = (header[8]  << 8) | header[7];
-    cpu_z80.R1.wr.HL   = (header[10] << 8) | header[9];
-    cpu_z80.R1.wr.DE   = (header[12] << 8) | header[11];
-    cpu_z80.R1.wr.BC   = (header[14] << 8) | header[13];
-    cpu_z80.R1.wr.IY   = (header[16] << 8) | header[15];
-    cpu_z80.R1.wr.IX   = (header[18] << 8) | header[17];
-    /* Byte 19: docs clásicos indican IFF2; usamos bit2 o cualquier no-cero como habilitado */
-    cpu_z80.IFF2       = (header[19] & 0x04) ? 1 : (header[19] ? 1 : 0);
-    cpu_z80.R          = header[20];
-    cpu_z80.R1.wr.AF   = (header[22] << 8) | header[21];
-    cpu_z80.R1.wr.SP   = (header[24] << 8) | header[23];
-    cpu_z80.IM         = header[25];
-    border_color       = header[26] & 0x07;
-
-    /* RAM 48K */
-    uint8_t ram48k[49152];
-    if (fread(ram48k, 1, sizeof(ram48k), f) != sizeof(ram48k)) {
-        fclose(f);
-        fprintf(stderr, "Archivo .sna incompleto (RAM 48K)\n");
-        return false;
-    }
-
-    bool is128k = (fsz == 131103L || fsz == 147487L);
-
-    if (!is128k) {
-        /* 48K puro → copiar a 0x4000..0xFFFF */
-        for (uint32_t off = 0; off < sizeof(ram48k); ++off)
-            mem_write(0, 0x4000u + off, ram48k[off]);
-
-        /* PC desde la pila; SP += 2 */
-        uint16_t sp = cpu_z80.R1.wr.SP;
-        uint8_t pcl = mem_read(0, sp);
-        uint8_t pch = mem_read(0, sp + 1);
-        cpu_z80.PC = ((uint16_t)pch << 8) | pcl;
-        cpu_z80.R1.wr.SP = sp + 2;
-
-        cpu_z80.IFF1 = cpu_z80.IFF2;
-
-        fclose(f);
-        printf("Snapshot .sna (48K) cargado: %s\n", filename);
-        printf("PC=0x%04X  SP=0x%04X  Border=%d  IM=%d\n",
-               cpu_z80.PC, cpu_z80.R1.wr.SP, border_color, cpu_z80.IM);
-        return true;
-    }
-
-    /* 128K */
-    int pcl = fgetc(f), pch = fgetc(f);
-    if (pcl == EOF || pch == EOF) { fclose(f); fprintf(stderr, "SNA 128K: error leyendo PC\n"); return false; }
-    cpu_z80.PC = (uint16_t)(pcl | (pch << 8));
-
-    int last7ffd = fgetc(f);
-    int trdos    = fgetc(f);
-    if (last7ffd == EOF || trdos == EOF) { fclose(f); fprintf(stderr, "SNA 128K: error leyendo 7FFD/TRDOS\n"); return false; }
-    uint8_t latch7ffd = (uint8_t)last7ffd;
-    uint8_t bank_n = latch7ffd & 0x07;
-
-    /* 48K iniciales → bancos 5 / n / 2 */
-    memcpy(&ram[RAM(5)][0],        &ram48k[0x0000], 16384);
-    memcpy(&ram[RAM(bank_n)][0],   &ram48k[0x4000], 16384);
-    memcpy(&ram[RAM(2)][0],        &ram48k[0x8000], 16384);
-
-    /* Rellenar el resto de bancos (5 o 6) en orden de archivo */
-    int remain[8] = {0,1,2,3,4,5,6,7};
-    remain[5] = -1; remain[2] = -1; remain[bank_n] = -1;
-
-    for (int b = 0; b < 8; ++b) {
-        if (remain[b] >= 0) {
-            if (fread(&ram[RAM(remain[b])][0], 1, 16384, f) != 16384) {
-                fclose(f);
-                fprintf(stderr, "SNA 128K: error leyendo banco %d\n", remain[b]);
-                return false;
-            }
-        }
-    }
-
-    /* Ajustar latch de paginación / MMU */
-    mlatch = latch7ffd & 0x3F;
-    recalc_mmu();
-
-    /* Sincronizar ventana visible con snapshot */
-    for (uint32_t off = 0; off < 16384; ++off)
-        mem_write(0, 0x4000u + off, ram[RAM(5)][off]);
-    for (uint32_t off = 0; off < 16384; ++off)
-        mem_write(0, 0x8000u + off, ram[RAM(2)][off]);
-    for (uint32_t off = 0; off < 16384; ++off)
-        mem_write(0, 0xC000u + off, ram[RAM(bank_n)][off]);
-
-    cpu_z80.IFF1 = cpu_z80.IFF2;
-
-    fclose(f);
-    printf("Snapshot .sna (128K) cargado: %s  (7FFD=0x%02X, n=%u, TR-DOS=%u)\n",
-           filename, latch7ffd, bank_n, trdos);
-    printf("PC=0x%04X  SP=0x%04X  Border=%d  IM=%d\n",
-           cpu_z80.PC, cpu_z80.R1.wr.SP, border_color, cpu_z80.IM);
-
-    return true;
-}
-
-/* ─────────────────────────────────────────────────────────────
- * TAP fast loader + listado
- *   - Formato: [len_lo len_hi][flag][payload][checksum XOR]
- *   - Header ROM: 17 bytes -> type, name(10), len_data, p1, p2
- *   - CODE/SCREEN$: carga a p1 (start address) con len_data bytes.
- * Refs: Sinclair Wiki TAP format / Spectrum tape interface
- * ───────────────────────────────────────────────────────────── */
-static inline uint16_t rd_le16_file(FILE* f)
-{
-    int lo = fgetc(f);
-    int hi = fgetc(f);
-    if (lo == EOF || hi == EOF) return 0;
-    return (uint16_t)(lo | (hi << 8));
-}
-
-typedef struct {
-    uint8_t  type;      /* 0,1,2,3 (PROGRAM, NUM, CHAR, CODE) */
-    char     name[11];  /* 10 chars + NUL */
-    uint16_t len_data;
-    uint16_t p1;        /* para CODE: dirección de carga */
-    uint16_t p2;        /* para CODE: normalmente 32768 (0x8000) */
-} tap_header_t;
-
-static bool tap_read_header(FILE* f, long block_start_pos, uint16_t blk_len, tap_header_t* out)
-{
-    uint8_t hdr[17];
-    if (fread(hdr, 1, 17, f) != 17) return false;
-
-    /* checksum (1 byte) */
-    int chks = fgetc(f); (void)chks;
-
-    out->type = hdr[0];
-    memcpy(out->name, &hdr[1], 10);
-    out->name[10] = 0;
-    out->len_data = (uint16_t)(hdr[11] | (hdr[12] << 8));
-    out->p1       = (uint16_t)(hdr[13] | (hdr[14] << 8));
-    out->p2       = (uint16_t)(hdr[15] | (hdr[16] << 8));
-
-    if (blk_len != 19) {
-        fprintf(stderr, "[TAP] Advertencia: cabecera con len=%u (esperado 19)\n", blk_len);
-    }
-    return true;
-}
-
-/* Lista TAP por consola (no carga) */
-static void tap_list(const char* path)
-{
-    if (!path) { fprintf(stderr, "[TAP] No hay fichero (-t)\n"); return; }
-
-    FILE* f = fopen(path, "rb");
-    if (!f) { perror(path); return; }
-
-    long block_start = 0;
-    
-    printf("Bloque: %ld", block_start);
-
-    printf("=== TAP LIST: %s ===\n", path);
-    int index = 0;
-    while (1) {
-        uint16_t blk_len = rd_le16_file(f);
-        if (feof(f)) break;
-        if (blk_len == 0 && ferror(f)) { perror("[TAP]"); break; }
-
-        block_start = ftell(f);
-        int flag = fgetc(f);
-        if (flag == EOF) break;
-
-        if (flag == 0x00) {
-            uint8_t hdr[17];
-            if (fread(hdr, 1, 17, f) != 17) { fprintf(stderr, "[TAP] header truncado\n"); break; }
-            int ch = fgetc(f); (void)ch;
-
-            uint8_t type = hdr[0];
-            char name[11]; memcpy(name, &hdr[1], 10); name[10] = 0;
-            uint16_t len_data = (uint16_t)(hdr[11] | (hdr[12] << 8));
-            uint16_t p1       = (uint16_t)(hdr[13] | (hdr[14] << 8));
-            uint16_t p2       = (uint16_t)(hdr[15] | (hdr[16] << 8));
-
-            const char* tname = (type==0?"PROGRAM":(type==1?"NUMARRAY":(type==2?"CHARARRAY":(type==3?"CODE":"?"))));
-            printf(" [%03d] HEADER  len=%u  type=%s  name=\"%.*s\"  data=%u  p1=%u  p2=%u\n",
-                   index++, blk_len, tname, 10, name, len_data, p1, p2);
-        } else if (flag == 0xFF) {
-            size_t toread = (blk_len >= 1) ? (blk_len - 1) : 0;
-            if (toread >= 1) {
-                fseek(f, (long)(toread - 1), SEEK_CUR);
-                int cs = fgetc(f); (void)cs;
-            }
-            printf(" [%03d] DATA    len=%u\n", index++, blk_len);
-        } else {
-            size_t skip = (blk_len >= 1) ? (blk_len - 1) : 0;
-            if (skip) fseek(f, (long)skip, SEEK_CUR);
-            printf(" [%03d] FLAG=0x%02X (saltado) len=%u\n", index++, flag, blk_len);
-        }
-    }
-
-    fclose(f);
-}
-
-/* Carga CODE/SCREEN$ de un TAP. Autostart opcional (PC := start address del último CODE) */
-bool load_tap_fast(const char* path, int auto_start)
-{
-    FILE* f = fopen(path, "rb");
-    if (!f) { perror(path); return false; }
-
-    long block_start = 0;
-
-    printf("=== TAP: %s ===\n", path);
-
-    tap_header_t last_hdr = {0};
-    bool have_hdr = false;
-    bool loaded_any_code = false;
-    uint16_t last_code_start = 0;
-
-    while (1) {
-        uint16_t blk_len = rd_le16_file(f);
-        if (feof(f)) break;
-        if (blk_len == 0 && ferror(f)) { fclose(f); return false; }
-
-        block_start = ftell(f);
-        int flag = fgetc(f);
-        if (flag == EOF) break;
-
-        if (flag == 0x00) {
-            tap_header_t H;
-            if (!tap_read_header(f, block_start, blk_len, &H)) { fclose(f); return false; }
-            have_hdr = true; last_hdr = H;
-
-            const char* tname = (H.type==0?"PROGRAM":(H.type==1?"NUMARRAY":(H.type==2?"CHARARRAY":(H.type==3?"CODE":"?"))));
-            printf(" - HEADER: type=%s  name=\"%.*s\"  len_data=%u  p1=%u  p2=%u\n",
-                   tname, 10, last_hdr.name, last_hdr.len_data, last_hdr.p1, last_hdr.p2);
-        }
-        else if (flag == 0xFF) {
-            if (!have_hdr) {
-                size_t toread = (blk_len >= 1) ? (blk_len - 1) : 0; /* payload + checksum */
-                if (toread > 0) fseek(f, (long)toread, SEEK_CUR);
-                printf(" - DATA sin header previo: saltado (%u bytes)\n", blk_len);
-                continue;
-            }
-
-            /* payload (dsz = blk_len-2 bytes de datos + 1 checksum al final) */
-            uint16_t payload_len = (blk_len >= 2) ? (blk_len - 2) : 0;
-            if (payload_len < 1) { fclose(f); fprintf(stderr, "[TAP] DATA tamaño inválido.\n"); return false; }
-
-            uint8_t* buf = (uint8_t*)malloc(payload_len);
-            if (!buf) { fclose(f); return false; }
-
-            size_t rd = fread(buf, 1, payload_len, f);
-            if (rd != payload_len) { free(buf); fclose(f); return false; }
-
-            uint8_t *data = buf;
-            size_t   dsz  = (payload_len >= 1) ? (payload_len - 1) : 0; /* sin checksum final */
-            uint16_t declared = last_hdr.len_data;
-
-            if (last_hdr.type == 3) {
-                uint16_t start = last_hdr.p1;
-                size_t tocopy = (declared <= dsz) ? declared : dsz;
-                printf("   · Cargando CODE en 0x%04X (%zu bytes)\n", start, tocopy);
-
-                for (size_t i = 0; i < tocopy; ++i) {
-                    mem_write(0, (uint16_t)(start + i), data[i]);
-                }
-                loaded_any_code = true;
-                last_code_start = start;
-            } else {
-                printf("   · DATA type=%u no cargado (soportado solo CODE por ahora)\n", last_hdr.type);
-            }
-
-            free(buf);
-            have_hdr = false;
-        }
-        else {
-            size_t skip = (blk_len >= 1) ? (blk_len - 1) : 0;
-            if (skip) fseek(f, (long)skip, SEEK_CUR);
-            printf(" - FLAG 0x%02X no estándar: saltado (%u bytes)\n", flag, blk_len);
-        }
-    }
-
-    fclose(f);
-
-    if (loaded_any_code) {
-        if (auto_start) {
-            cpu_z80.PC = last_code_start;
-            printf("AUTO-START: PC := 0x%04X\n", cpu_z80.PC);
-        }
-    } else {
-        fprintf(stderr, "[TAP] No se cargó ningún bloque CODE.\n");
-        return false;
-    }
-
-    return true;
 }
 
 /* ─────────────────────────────────────────────────────────────
@@ -1356,7 +835,7 @@ static void handle_hotkeys(const char* tap_path, const char* tzx_path)
             fprintf(stderr, "[F6] No hay TAP (usa -t <fichero.tap>)\n");
         } else {
             printf("[F6] Reload TAP & Auto-Start: %s\n", tap_path);
-            if (!load_tap_fast(tap_path, /*auto_start=*/1))
+            if (!load_tap_fast(tap_path, /*auto_start=*/1, &cpu_z80, mem_write))
                 fprintf(stderr, "[TAP] Fallo al recargar: %s\n", tap_path);
         }
     }
@@ -1613,7 +1092,7 @@ int main(int argc, char *argv[])
 
     /* TAP (fast) – inyección directa */
     if (tapepath) {
-        if (!load_tap_fast(tapepath, /*auto_start=*/1)) {
+        if (!load_tap_fast(tapepath, /*auto_start=*/1, &cpu_z80, mem_write)) {
             fprintf(stderr, "Fallo al cargar TAP (fast): %s\n", tapepath);
         } else {
             printf("TAP (fast) cargado correctamente.\n");
@@ -1622,7 +1101,7 @@ int main(int argc, char *argv[])
 
     /* TAP por pulsos – reproducción en EAR para la ROM */
     if (tap_pulses_path) {
-        if (tape_load_tap_pulses(tap_pulses_path) != 0) {
+        if (tape_load_tap_pulses(&tape, tap_pulses_path) != 0) {
             fprintf(stderr, "Fallo al cargar TAP (pulsos): %s\n", tap_pulses_path);
         } else {
             printf("Reproduciendo cinta por pulsos (ROM std): %s\n", tap_pulses_path);
@@ -1646,7 +1125,16 @@ int main(int argc, char *argv[])
 
     if (snapath)
     {
-        load_sna(snapath);
+        sna_context_t sna_ctx = {
+            .cpu         = &cpu_z80,
+            .ram         = ram,
+            .border_color = &border_color,
+            .mlatch      = &mlatch,
+            .mem_write   = mem_write,
+            .mem_read    = mem_read,
+            .recalc_mmu  = recalc_mmu,
+        };
+        load_sna(snapath, &sna_ctx);
     }
 
     if (idepath) {
