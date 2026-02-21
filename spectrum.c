@@ -60,6 +60,9 @@ static uint32_t texturebits[WIDTH * HEIGHT];
 
 uint8_t border_color   = 7;
 
+static uint8_t border_for_scanline[HEIGHT];
+static unsigned frame_scanline_idx = 0;
+
 static uint32_t palette[16] = {
     0xFF000000, 0xFF0000D8, 0xFFD80000, 0xFFD800D8,
     0xFF00D800, 0xFF00D8D8, 0xFFD8D800, 0xFFD8D8D8,
@@ -933,6 +936,15 @@ static void raster_block(unsigned ybase, unsigned off, unsigned aoff)
 
 static void spectrum_rasterize(void)
 {
+    /* Fill entire framebuffer with per-scanline border colour */
+    for (unsigned y = 0; y < HEIGHT; ++y) {
+        uint32_t col = palette[border_for_scanline[y] & 0x0F];
+        uint32_t *p = texturebits + y * WIDTH;
+        for (unsigned x = 0; x < WIDTH; ++x)
+            p[x] = col;
+    }
+
+    /* Overwrite central area with screen content */
     raster_block(0, 0x0000, 0x1800);
     raster_block(64, 0x0800, 0x1900);
     raster_block(128, 0x1000, 0x1A00);
@@ -979,6 +991,9 @@ static void run_scanlines(unsigned lines, unsigned blank)
         drawline = 0;
     /* Run scanlines */
     for (i = 0; i < lines; i++) {
+        if (frame_scanline_idx < HEIGHT)
+            border_for_scanline[frame_scanline_idx] = border_color;
+        frame_scanline_idx++;
         /* Delimitamos porciones (beeper + cinta) alrededor de la ejecución */
         beeper_begin_slice();
         tape_begin_slice();
@@ -1684,6 +1699,7 @@ int main(int argc, char *argv[])
         handle_hotkeys(tapepath, tzx_path);
 
         /* 192 scanlines framebuffer */
+        frame_scanline_idx = 0;
         run_scanlines(192, 1);
         /* and border */
         run_scanlines(56, 0);
