@@ -8,9 +8,9 @@
 
 /* Reproductor TZX por pulsos:
  *  - tzx_load_file(): carga .tzx en memoria
- *  - tzx_begin_slice()/tzx_end_slice(): sincronización por porciones (t-states)
+ *  - tzx_begin_slice()/tzx_end_slice(): sincronizaciï¿½n por porciones (t-states)
  *  - tzx_ear_bit6(): bit 6 (EAR) para inyectar en la lectura del puerto FEh
- *  - tzx_play/pause/rewind: control de reproducción
+ *  - tzx_play/pause/rewind: control de reproducciï¿½n
  */
 
 #ifdef __cplusplus
@@ -33,6 +33,13 @@ void tzx_end_slice  (tzx_player_t* tp, const Z80Context* cpu, uint64_t* io_new_f
 
 uint8_t tzx_ear_bit6(const tzx_player_t* tp);
 int     tzx_active  (const tzx_player_t* tp);
+
+/* Optional callback invoked (with the exact edge t-state and new level 0/1)
+ * just before each EAR level transition.  The host uses this to advance the
+ * audio generator before the level changes so that the tape sound is correctly
+ * mixed into the output stream. */
+typedef void (*tzx_ear_notify_fn)(uint64_t t_abs, int new_level);
+void tzx_set_ear_notify(tzx_player_t* tp, tzx_ear_notify_fn fn);
 
 const char* tzx_last_error(const tzx_player_t* tp);
 

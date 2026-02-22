@@ -12,6 +12,21 @@
 #include <stdlib.h>
 #include <string.h>
 
+/* Optional host callback: called before each EAR level transition */
+static tape_ear_notify_fn g_tape_ear_notify = NULL;
+
+void tape_set_ear_notify(tape_ear_notify_fn fn)
+{
+    g_tape_ear_notify = fn;
+}
+
+/* Helper: notify and flip level */
+#define TAPE_EAR_TOGGLE(t, t_abs) do { \
+    int _nl = (t)->ear_level ^ 1; \
+    if (g_tape_ear_notify) g_tape_ear_notify((t_abs), _nl); \
+    (t)->ear_level = _nl; \
+} while (0)
+
 /* ─────────────────────────────────────────────────────────────
  * TAP por pulsos (ROM estándar) - Motor de cinta
  * ───────────────────────────────────────────────────────────── */
@@ -100,13 +115,13 @@ static void tape_advance_to(tape_player_t *t, uint64_t t_now)
             t->pilot_left = (flag == 0x00) ? PILOT_HDR : PILOT_DATA;
             t->phase = TP_PILOT;
             t->next_edge_at = t_now + T_PILOT;
-            t->ear_level ^= 1;
+            TAPE_EAR_TOGGLE(t, t_now);
             t->i_byte = 0; t->bit_mask = 0x80; t->subpulse = 0;
             break;
         }
         case TP_PILOT:
             if (t_now < t->next_edge_at) return;
-            t->ear_level ^= 1;
+            TAPE_EAR_TOGGLE(t, t->next_edge_at);
             if (--t->pilot_left > 0) {
                 t->next_edge_at += T_PILOT;
             } else {
@@ -117,14 +132,14 @@ static void tape_advance_to(tape_player_t *t, uint64_t t_now)
 
         case TP_SYNC1:
             if (t_now < t->next_edge_at) return;
-            t->ear_level ^= 1;
+            TAPE_EAR_TOGGLE(t, t->next_edge_at);
             t->phase = TP_SYNC2;
             t->next_edge_at += T_SYNC2;
             break;
 
         case TP_SYNC2:
             if (t_now < t->next_edge_at) return;
-            t->ear_level ^= 1;
+            TAPE_EAR_TOGGLE(t, t->next_edge_at);
             t->phase = TP_BITS;
             t->i_byte = 0; t->bit_mask = 0x80; t->subpulse = 0;
             {
@@ -136,7 +151,7 @@ static void tape_advance_to(tape_player_t *t, uint64_t t_now)
 
         case TP_BITS: {
             if (t_now < t->next_edge_at) return;
-            t->ear_level ^= 1;
+            TAPE_EAR_TOGGLE(t, t->next_edge_at);
             uint8_t b = t->blk[t->i_blk].data[t->i_byte];
             int bit = (b & t->bit_mask) ? 1 : 0;
             int tlen = bit ? T_BIT1 : T_BIT0;

@@ -64,6 +64,11 @@ void    tape_end_slice(tape_player_t *t, const Z80Context *cpu);
 int     tape_active(const tape_player_t *t);
 uint8_t tape_ear_bit6(const tape_player_t *t);
 
+/* Optional callback invoked just before each EAR level transition.
+ * t_abs is the absolute t-state of the edge; new_level is 0 or 1. */
+typedef void (*tape_ear_notify_fn)(uint64_t t_abs, int new_level);
+void tape_set_ear_notify(tape_ear_notify_fn fn);
+
 /* ── Fast TAP loader API ── */
 void tap_list(const char *path);
 bool load_tap_fast(const char *path, int auto_start,

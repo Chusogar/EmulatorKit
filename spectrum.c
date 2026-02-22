@@ -136,11 +136,14 @@ static SDL_AudioDeviceID audio_dev = 0;
 static SDL_AudioSpec have;
 static int audio_rate = 44100;
 static float beeper_volume = 0.30f;
+static float tape_volume   = 0.15f;  /* volume for tape EAR-in signal */
 
 static uint64_t beeper_frame_origin = 0;
 static uint64_t beeper_slice_origin = 0;
 static uint64_t beeper_last_tstate  = 0;
 static int      beeper_level        = 0;   /* 0 o 1 (onda cuadrada) */
+static int      tape_ear_level      = 0;   /* 0 o 1: EAR input from tape/TZX */
+static int      tape_ear_active     = 0;   /* 1 when tape/TZX is playing */
 static double   beeper_frac_acc     = 0.0;
 
 static int audio_init_sdl(int rate)
@@ -176,8 +179,15 @@ static inline void beeper_advance_to(uint64_t t_now)
     if (nsamp <= 0) return;
     beeper_frac_acc -= nsamp;
 
-    int16_t val = beeper_level ? (int16_t)(+beeper_volume * 32767.0f)
-                               : (int16_t)(-beeper_volume * 32767.0f);
+    /* Mix beeper (EAR/MIC out) with tape EAR-in signal.
+     * Gate the tape contribution so silence when nothing is playing. */
+    float bv = beeper_level ? beeper_volume : -beeper_volume;
+    float tv = tape_ear_active ? (tape_ear_level ? tape_volume : -tape_volume) : 0.0f;
+    float mixed = bv + tv;
+    if (mixed >  1.0f) mixed =  1.0f;
+    if (mixed < -1.0f) mixed = -1.0f;
+    int16_t val = (int16_t)(mixed * 32767.0f);
+
     enum { CHUNK = 4096 };
     static int16_t buf[CHUNK];
     while (nsamp > 0) {
@@ -212,6 +222,17 @@ static inline void beeper_set_from_ula(uint8_t v)
 {
     int level = ((v >> 4) & 1) | ((v >> 3) & 1);
     beeper_set_level(level);
+}
+
+/* ─────────────────────────────────────────────────────────────
+ * Tape EAR-in audio callback.
+ * Called by tape.c / tzx.c before each EAR level change so the
+ * audio generator is flushed to the exact edge time first.
+ * ───────────────────────────────────────────────────────────── */
+static void on_tape_ear_change(uint64_t t_abs, int new_level)
+{
+    beeper_advance_to(t_abs);   /* flush audio up to this edge */
+    tape_ear_level = new_level;
 }
 
 /* ─────────────────────────────────────────────────────────────
@@ -945,14 +966,19 @@ static void run_scanlines(unsigned lines, unsigned blank)
             tzx_begin_slice(tzx_player, tzx_frame_origin);
         }
 
+        /* Update tape_ear_active once per scanline */
+        tape_ear_active = tape_active(&tape) || (tzx_player && tzx_active(tzx_player));
+
         n = tpl + tpl - Z80ExecuteTStates(&cpu_z80, n);
 
-        beeper_end_slice();
-        border_end_slice();
+        /* Tape/TZX end first: their callbacks advance the beeper audio
+         * to each edge time before beeper_end_slice() flushes the rest. */
         tape_end_slice(&tape, &cpu_z80);
         if (tzx_player) {
             tzx_end_slice(tzx_player, &cpu_z80, &tzx_frame_origin);
         }
+        border_end_slice();
+        beeper_end_slice();
 
         if (!blanked)
             drawline++;
@@ -1026,11 +1052,16 @@ static void handle_hotkeys(const char* tap_path, const char* tzx_path)
         if (tzx_path && tzx_player) {
             tzx_rewind(tzx_player);
             tzx_play(tzx_player);
-            tzx_frame_origin = 0;
+            /* Anchor TZX to the current absolute emulator time so callbacks
+             * and beeper_advance_to() share the same time base. */
+            tzx_frame_origin = beeper_frame_origin;
             fprintf(stdout, "[F9] TZX REWIND\n");
         } else {
-            tape.i_blk = 0; tape.phase = TP_NEXTBLOCK; tape.frame_origin = tape.slice_origin = 0;
-            tape.next_edge_at = 0; tape.pause_end_at = 0; tape.ear_level = 1; tape.playing = 1;
+            tape.i_blk = 0; tape.phase = TP_NEXTBLOCK;
+            /* Same time-base synchronisation for TAP rewind */
+            tape.frame_origin = tape.slice_origin = beeper_frame_origin;
+            tape.next_edge_at = 0; tape.pause_end_at = 0;
+            tape.ear_level = 1; tape.playing = 1;
             fprintf(stdout, "[F9] Tape REWIND\n");
         }
     }
@@ -1260,6 +1291,9 @@ int main(int argc, char *argv[])
         }
     }
 
+    /* Register tape EAR-in audio callback for mixing */
+    tape_set_ear_notify(on_tape_ear_change);
+
     /* TAP por pulsos – reproducción en EAR para la ROM */
     if (tap_pulses_path) {
         if (tape_load_tap_pulses(&tape, tap_pulses_path) != 0) {
@@ -1276,6 +1310,7 @@ int main(int argc, char *argv[])
             fprintf(stderr, "TZX: error al crear el reproductor.\n");
             exit(EXIT_FAILURE);
         }
+        tzx_set_ear_notify(tzx_player, on_tape_ear_change);
         if (tzx_load_file(tzx_player, tzx_path) != 0) {
             fprintf(stderr, "TZX: error al cargar '%s': %s\n",
                     tzx_path, tzx_last_error(tzx_player));
