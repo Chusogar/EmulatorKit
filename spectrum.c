@@ -10,13 +10,16 @@
  *   - Kempston joystick on port 0x1F (arrow keys + Ctrl/Space/Enter = FIRE)
  *   - TAP fast loader: injects CODE/SCREEN$ blocks to param1 address, no EAR/timing
  *   - TAP pulse player (ROM-accurate): pilot/sync/bits/pauses on EAR input
+ *   - TZX pulse player: full TZX support via tzx.c (blocks 0x10-0x19, control)
  *   - Beeper (EAR|MIC) audio via SDL2 (queue mode)
  *   - Hotkeys: F6 (reload TAP & autostart fast), F7 (list TAP),
- *              F8 (Play/Pause tape pulses), F9 (Rewind tape pulses)
+ *              F8 (Play/Pause tape/TZX pulses), F9 (Rewind tape/TZX pulses)
  *
  *  TAP format refs:
  *    - https://sinclair.wiki.zxnet.co.uk/wiki/TAP_format
  *    - https://sinclair.wiki.zxnet.co.uk/wiki/Spectrum_tape_interface
+ *  TZX format refs:
+ *    - https://sinclair.wiki.zxnet.co.uk/wiki/TZX_format
  *  SNA format refs:
  *    - https://sinclair.wiki.zxnet.co.uk/wiki/SNA_format
  *    - https://worldofspectrum.net/zx-modules/fileformats/snaformat.html
@@ -39,6 +42,7 @@
 #include "z80dis.h"
 #include "ide.h"
 #include "lib765/include/765.h"
+#include "tzx.h"
 
 #include <SDL2/SDL.h>
 #include "event.h"
@@ -55,6 +59,9 @@ static SDL_Texture *texture;
 static uint32_t texturebits[WIDTH * HEIGHT];
 
 uint8_t border_color   = 7;
+
+static uint8_t border_for_scanline[HEIGHT];
+static unsigned frame_scanline_idx = 0;
 
 static uint32_t palette[16] = {
     0xFF000000, 0xFF0000D8, 0xFFD80000, 0xFFD800D8,
@@ -491,6 +498,12 @@ typedef struct {
 
 static tape_player_t tape = {0};
 
+/* ─────────────────────────────────────────────────────────────
+ * TZX player (via tzx.c)
+ * ───────────────────────────────────────────────────────────── */
+static tzx_player_t *tzx_player = NULL;
+static uint64_t      tzx_frame_origin = 0;
+
 static inline int tape_active(void) { return tape.playing && tape.phase != TP_DONE; }
 static inline uint8_t tape_ear_bit6(void) { return (tape_active() && tape.ear_level) ? 0x40 : 0x00; }
 
@@ -679,6 +692,8 @@ static uint8_t ula_read(uint16_t addr)
     uint8_t ear_b6 = 0x00;
     if (tape_active()) {
         ear_b6 = tape_ear_bit6();
+    } else if (tzx_active(tzx_player)) {
+        ear_b6 = tzx_ear_bit6(tzx_player);
     } else if (model != ZX_PLUS3) {
         if (ula & 0x10)     /* Issue 3 and later */
             ear_b6 = 0x40;
@@ -921,6 +936,15 @@ static void raster_block(unsigned ybase, unsigned off, unsigned aoff)
 
 static void spectrum_rasterize(void)
 {
+    /* Fill entire framebuffer with per-scanline border colour */
+    for (unsigned y = 0; y < HEIGHT; ++y) {
+        uint32_t col = palette[border_for_scanline[y] & 0x0F];
+        uint32_t *p = texturebits + y * WIDTH;
+        for (unsigned x = 0; x < WIDTH; ++x)
+            p[x] = col;
+    }
+
+    /* Overwrite central area with screen content */
     raster_block(0, 0x0000, 0x1800);
     raster_block(64, 0x0800, 0x1900);
     raster_block(128, 0x1000, 0x1A00);
@@ -967,14 +991,23 @@ static void run_scanlines(unsigned lines, unsigned blank)
         drawline = 0;
     /* Run scanlines */
     for (i = 0; i < lines; i++) {
+        if (frame_scanline_idx < HEIGHT)
+            border_for_scanline[frame_scanline_idx] = border_color;
+        frame_scanline_idx++;
         /* Delimitamos porciones (beeper + cinta) alrededor de la ejecución */
         beeper_begin_slice();
         tape_begin_slice();
+        if (tzx_player) {
+            tzx_begin_slice(tzx_player, tzx_frame_origin);
+        }
 
         n = 224 + 224 - Z80ExecuteTStates(&cpu_z80, n);
 
         beeper_end_slice();
         tape_end_slice();
+        if (tzx_player) {
+            tzx_end_slice(tzx_player, &cpu_z80, &tzx_frame_origin);
+        }
 
         if (!blanked)
             drawline++;
@@ -1319,7 +1352,7 @@ bool load_tap_fast(const char* path, int auto_start)
  * Hotkeys (SDL): F6 = Reload TAP & Auto-Start; F7 = List TAP
  *                F8 = Play/Pause tape pulses; F9 = Rewind tape
  * ───────────────────────────────────────────────────────────── */
-static void handle_hotkeys(const char* tap_path)
+static void handle_hotkeys(const char* tap_path, const char* tzx_path)
 {
     SDL_PumpEvents(); /* actualiza estado */
 
@@ -1351,13 +1384,30 @@ static void handle_hotkeys(const char* tap_path)
     }
 
     if (f8 && !prev_f8) {
-        tape.playing = !tape.playing;
-        fprintf(stdout, "[F8] Tape %s\n", tape.playing ? "PLAY" : "PAUSE");
+        if (tzx_path && tzx_player) {
+            if (tzx_active(tzx_player)) {
+                tzx_pause(tzx_player, 1);
+                fprintf(stdout, "[F8] TZX PAUSE\n");
+            } else {
+                tzx_play(tzx_player);
+                fprintf(stdout, "[F8] TZX PLAY\n");
+            }
+        } else {
+            tape.playing = !tape.playing;
+            fprintf(stdout, "[F8] Tape %s\n", tape.playing ? "PLAY" : "PAUSE");
+        }
     }
     if (f9 && !prev_f9) {
-        tape.i_blk = 0; tape.phase = TP_NEXTBLOCK; tape.frame_origin = tape.slice_origin = 0;
-        tape.next_edge_at = 0; tape.pause_end_at = 0; tape.ear_level = 1; tape.playing = 1;
-        fprintf(stdout, "[F9] Tape REWIND\n");
+        if (tzx_path && tzx_player) {
+            tzx_rewind(tzx_player);
+            tzx_play(tzx_player);
+            tzx_frame_origin = 0;
+            fprintf(stdout, "[F9] TZX REWIND\n");
+        } else {
+            tape.i_blk = 0; tape.phase = TP_NEXTBLOCK; tape.frame_origin = tape.slice_origin = 0;
+            tape.next_edge_at = 0; tape.pause_end_at = 0; tape.ear_level = 1; tape.playing = 1;
+            fprintf(stdout, "[F9] Tape REWIND\n");
+        }
     }
 
 	if (f11) {
@@ -1387,7 +1437,8 @@ static void handle_hotkeys(const char* tap_path)
 static void usage(void)
 {
     fprintf(stderr, "spectrum: [-f] [-r path] [-d debug] [-A disk] [-B disk]\n"
-            "          [-i idedisk] [-I dividerom] [-t tap] [-s sna] [-T tap_pulses]\n");
+            "          [-i idedisk] [-I dividerom] [-t tap] [-s sna] [-T tap_pulses]\n"
+            "          [-z tzxfile]\n");
     exit(EXIT_FAILURE);
 }
 
@@ -1405,9 +1456,10 @@ int main(int argc, char *argv[])
     char *pathb = NULL;
     char *snapath = NULL;
     char *tap_pulses_path = NULL;
+    char *tzx_path = NULL;
 
-    /* Añadimos 't:' (tap fast) y 'T:' (tap pulses) */
-    while ((opt = getopt(argc, argv, "d:f:r:m:i:I:A:B:s:t:T:")) != -1) {
+    /* Añadimos 't:' (tap fast), 'T:' (tap pulses) y 'z:' (TZX) */
+    while ((opt = getopt(argc, argv, "d:f:r:m:i:I:A:B:s:t:T:z:")) != -1) {
         switch (opt) {
         case 'r':
             rompath = optarg;
@@ -1423,6 +1475,9 @@ int main(int argc, char *argv[])
             break;
         case 'T':
             tap_pulses_path = optarg;
+            break;
+        case 'z':
+            tzx_path = optarg;
             break;
         case 'm':
             mem = atoi(optarg);
@@ -1589,6 +1644,21 @@ int main(int argc, char *argv[])
         }
     }
 
+    /* TZX – reproductor completo de ficheros .tzx */
+    if (tzx_path) {
+        tzx_player = tzx_create();
+        if (!tzx_player) {
+            fprintf(stderr, "TZX: error al crear el reproductor.\n");
+            exit(EXIT_FAILURE);
+        }
+        if (tzx_load_file(tzx_player, tzx_path) != 0) {
+            fprintf(stderr, "TZX: error al cargar '%s': %s\n",
+                    tzx_path, tzx_last_error(tzx_player));
+        } else {
+            printf("TZX cargado: %s\n", tzx_path);
+        }
+    }
+
     if (snapath)
     {
         load_sna(snapath);
@@ -1626,9 +1696,10 @@ int main(int argc, char *argv[])
     while (!emulator_done) {
         /* Hotkeys: F6 (reload TAP & autostart), F7 (list TAP),
                     F8 (play/pause pulses), F9 (rewind pulses) */
-        handle_hotkeys(tapepath);
+        handle_hotkeys(tapepath, tzx_path);
 
         /* 192 scanlines framebuffer */
+        frame_scanline_idx = 0;
         run_scanlines(192, 1);
         /* and border */
         run_scanlines(56, 0);
@@ -1650,5 +1721,6 @@ int main(int argc, char *argv[])
         SDL_CloseAudioDevice(audio_dev);
         audio_dev = 0;
     }
+    tzx_destroy(tzx_player);
     exit(0);
 }
