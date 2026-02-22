@@ -1,3 +1,4 @@
+/* tzx.c - TZX player (complete file) */
 #define _CRT_SECURE_NO_WARNINGS
 #include "tzx.h"
 #include <stdio.h>
@@ -6,7 +7,7 @@
 #include <assert.h>
 
 /* Frecuencia de la CPU (t-states/seg). En 128K ~3.5469MHz; 48K ~3.5MHz.
-   Las rutinas de carga de cinta son por flancos, la peque�a diferencia es tolerada. */
+   Las rutinas de carga de cinta son por flancos, la pequeña diferencia es tolerada. */
 #ifndef TZX_CPU_TSTATES
 #define TZX_CPU_TSTATES 3546900.0
 #endif
@@ -31,7 +32,7 @@ typedef enum {
 
 typedef struct {
     uint8_t flags;                /* 0: invert; 1: same; 2: force low; 3: force high (bits 0..1) */
-    uint8_t npulses;              /* N m�ximo por s�mbolo */
+    uint8_t npulses;              /* N máximo por símbolo */
     uint16_t pulses[TZX_MAX_PULSES];
 } tzx_symbol_t;
 
@@ -58,7 +59,7 @@ struct tzx_player {
     /* callback de audio: llamado antes de cada cambio de nivel EAR */
     tzx_ear_notify_fn notify_fn;
 
-    /* sub-estado com�n a varios bloques */
+    /* sub-estado común a varios bloques */
     uint32_t sub_ofs;
     uint32_t sub_len;
     uint16_t p_pilot_len, p_sync1, p_sync2, p_0, p_1;
@@ -67,7 +68,7 @@ struct tzx_player {
     uint32_t p_pause_ms;
     uint32_t data_len;
 
-    /* iteraci�n de bits */
+    /* iteración de bits */
     uint32_t i_byte;
     uint8_t  bit_mask;
     uint8_t  subpulse;
@@ -82,7 +83,7 @@ struct tzx_player {
     uint8_t  csw_ctype; /* 1 RLE; 2 Zero-RLE */
 
     /* 0x19 Generalized data */
-    /* par�metros */
+    /* parámetros */
     uint32_t gen_blen;
     uint16_t gen_pause;
     uint32_t gen_totp, gen_totd;
@@ -93,17 +94,17 @@ struct tzx_player {
     /* alfabetos */
     tzx_symbol_t gen_symP[TZX_MAX_ALPHA], gen_symD[TZX_MAX_ALPHA];
     int      gen_loaded;
-    /* estado s�mbolo en curso */
+    /* estado símbolo en curso */
     const tzx_symbol_t* gen_cur_sym;
-    int      gen_sym_ip;      /* �ndice de pulso dentro del s�mbolo */
+    int      gen_sym_ip;      /* índice de pulso dentro del símbolo */
     int      gen_sym_rem;     /* pulsos restantes */
     /* pilot stream */
-    uint32_t gen_pilot_pos;   /* s�mbolo # actual dentro de totp */
+    uint32_t gen_pilot_pos;   /* símbolo # actual dentro de totp */
     uint8_t  gen_pilot_sym_idx;
     uint16_t gen_pilot_rep_left;
     /* data stream */
-    int      gen_bits;        /* bits por s�mbolo (ceil log2(asd)) */
-    uint32_t gen_data_pos;    /* s�mbolo # consumidos */
+    int      gen_bits;        /* bits por símbolo (ceil log2(asd)) */
+    uint32_t gen_data_pos;    /* símbolo # consumidos */
     uint32_t gen_data_dsize;  /* bytes del stream de datos */
     uint32_t gen_data_ofs;    /* offset de lectura en dataStream */
     uint8_t  gen_data_byte;
@@ -122,7 +123,7 @@ static inline void tzx_set_error(tzx_player_t* tp, const char* msg){
 }
 
 /* Helper: notify host then flip EAR level.
- * t_edge is the exact t-state at which the transition occurs. */
+* t_edge is the exact t-state at which the transition occurs. */
 #define TZX_EAR_TOGGLE(tp, t_edge) do { \
     int _nl = (tp)->ear_level ^ 1; \
     if ((tp)->notify_fn) (tp)->notify_fn((t_edge), _nl); \
@@ -138,10 +139,10 @@ static inline void tzx_set_error(tzx_player_t* tp, const char* msg){
 } while (0)
 
 /* Maximum edges processed per tzx_advance_to() call.
- * A full PAL frame at 50 Hz contains ~69 888 t-states; the shortest
- * standard pulse is sync1 = 667 t-states, giving at most ~105 edges/frame.
- * CSW / direct-recording blocks can have much shorter pulses – 200 000
- * provides a safe headroom while bounding worst-case runtime. */
+* A full PAL frame at 50 Hz contains ~69 888 t-states; the shortest
+* standard pulse is sync1 = 667 t-states, giving at most ~105 edges/frame.
+* CSW / direct-recording blocks can have much shorter pulses – 200 000
+* provides a safe headroom while bounding worst-case runtime. */
 #define TZX_MAX_EDGES_PER_SLICE 200000
 
 /* ================ API pública =============================== */
@@ -491,7 +492,7 @@ static void tzx_proc_pure_data(tzx_player_t* tp, uint64_t t_now)
 
 /* -------- 0x15 Direct recording -------- */
 
-/* Lee el bit i-�simo (MSB-first dentro de cada byte) desde Direct Recording */
+/* Lee el bit i-ésimo (MSB-first dentro de cada byte) desde Direct Recording */
 static inline int dr_get_bit(const uint8_t* base, uint32_t sub_ofs, uint32_t i)
 {
     uint32_t byte_i = i >> 3;          /* i / 8 */
@@ -500,7 +501,7 @@ static inline int dr_get_bit(const uint8_t* base, uint32_t sub_ofs, uint32_t i)
     return (b >> bit_i) & 1;
 }
 
-/* Devuelve la primera posici�n >= start_bit donde el bit cambia, o total_bits si no cambia */
+/* Devuelve la primera posición >= start_bit donde el bit cambia, o total_bits si no cambia */
 static inline uint32_t dr_scan_run(const uint8_t* base, uint32_t sub_ofs,
                                    uint32_t start_bit, uint32_t total_bits)
 {
@@ -607,7 +608,7 @@ static void tzx_init_csw(tzx_player_t* tp)
     tp->sub_ofs = 14; tp->sub_len = blen;
     tp->i_byte = 0; tp->csw_ctype = ctype;
 
-    /* Programaci�n diferida (se har� en proc) */
+    /* Programación diferida (se hará en proc) */
     tp->next_edge_at = 0;
 }
 static void tzx_proc_csw(tzx_player_t* tp, uint64_t t_now)
@@ -768,7 +769,7 @@ static void tzx_init_gen(tzx_player_t* tp)
     tzx_parse_generalized_tables(tp);
     tp->next_edge_at = 0;
     tp->pause_end_at = 0;
-    /* arrancar primer s�mbolo si hay pilot */
+    /* arrancar primer símbolo si hay pilot */
     if (tp->gen_phase==0){
         /* leer primera entrada pilot (idx+rep) */
         uint8_t sidx; uint16_t rep;
@@ -807,7 +808,7 @@ static void tzx_proc_gen(tzx_player_t* tp, uint64_t t_now)
                     gen_start_symbol(tp, &tp->gen_symP[tp->gen_pilot_sym_idx], t_now);
                 }
             } else {
-                /* a�n quedan repeticiones del mismo s�mbolo */
+                /* aún quedan repeticiones del mismo símbolo */
                 gen_start_symbol(tp, &tp->gen_symP[tp->gen_pilot_sym_idx], t_now);
             }
             return;
@@ -837,37 +838,37 @@ static void tzx_proc_gen(tzx_player_t* tp, uint64_t t_now)
         }
     }
 
-    /* Si hay un edge programado y a�n no hemos llegado, esperamos */
+    /* Si hay un edge programado y aún no hemos llegado, esperamos */
     if (tp->next_edge_at && t_now < tp->next_edge_at) return;
 
-    /* Consumimos un pulso del s�mbolo actual */
+    /* Consumimos un pulso del símbolo actual */
     if (tp->gen_cur_sym){
         int done = gen_advance_symbol(tp, t_now);
-        if (!done) return; /* sigue en el mismo s�mbolo (siguiente pulso ya programado) */
-        /* s�mbolo terminado: pasamos a repetir o al siguiente */
+        if (!done) return; /* sigue en el mismo símbolo (siguiente pulso ya programado) */
+        /* símbolo terminado: pasamos a repetir o al siguiente */
         if (tp->gen_phase==0){
             if (tp->gen_pilot_rep_left>0) tp->gen_pilot_rep_left--;
             if (tp->gen_pilot_rep_left>0){
-                /* repetir el mismo s�mbolo */
+                /* repetir el mismo símbolo */
                 return;
             } else {
                 /* siguiente entrada */
                 return;
             }
         } else if (tp->gen_phase==1){
-            /* siguiente s�mbolo de datos */
+            /* siguiente símbolo de datos */
             return;
         }
     }
 
-    /* Si no hay s�mbolo y no hay edge, avanzamos de fase en pr�xima llamada */
+    /* Si no hay símbolo y no hay edge, avanzamos de fase en próxima llamada */
 }
 
 /* ================ control de flujo y avance global ============ */
 
 static void tzx_next_block(tzx_player_t* tp){ tp->i_blk++; }
 
-/* Aplica bloques de control que no generan se�al inmediatamente */
+/* Aplica bloques de control que no generan señal inmediatamente */
 static int tzx_apply_control_blocks(tzx_player_t* tp, int* jumped)
 {
     *jumped = 0;
@@ -887,7 +888,7 @@ static int tzx_apply_control_blocks(tzx_player_t* tp, int* jumped)
             if (target >= tp->nblk){ tp->done=1; return 0; }
             tp->i_blk = target; *jumped=1; break;
         }
-        case 0x24: { /* loop start (no pila completa aqu�; se puede ampliar) */
+        case 0x24: { /* loop start (no pila completa aquí; se puede ampliar) */
             tzx_next_block(tp); break;
         }
         case 0x25: { /* loop end */
@@ -903,7 +904,7 @@ static int tzx_apply_control_blocks(tzx_player_t* tp, int* jumped)
         }
         case 0x27: tzx_next_block(tp); break; /* return */
         case 0x28: tzx_next_block(tp); break; /* select */
-        case 0x2A: tzx_next_block(tp); break; /* stop 48K (ignorado aqu�) */
+        case 0x2A: tzx_next_block(tp); break; /* stop 48K (ignorado aquí) */
         case 0x2B: { /* set signal */
             if (plen<5){ tp->done=1; return -1; }
             TZX_EAR_SET(tp, tp->slice_origin, p[4]?1:0);
@@ -919,7 +920,7 @@ static int tzx_apply_control_blocks(tzx_player_t* tp, int* jumped)
             return 0;
         }
         default:
-            return 0; /* productor de se�al */
+            return 0; /* productor de señal */
         }
     }
     tp->done=1;
@@ -1034,3 +1035,5 @@ void tzx_end_slice(tzx_player_t* tp, const Z80Context* cpu, uint64_t* io_new_fra
 /* ================ Consultas ================================ */
 int tzx_active(const tzx_player_t* tp){ return tp && tp->playing && !tp->done; }
 uint8_t tzx_ear_bit6(const tzx_player_t* tp){ return (tzx_active(tp) && tp->ear_level)?0x40:0x00; }
+
+
