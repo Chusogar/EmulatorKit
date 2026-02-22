@@ -550,8 +550,8 @@ static void tzx_proc_std_or_turbo(tzx_player_t* tp, uint64_t t_now)
         if (tp->bit_mask==0x01){ tp->bit_mask=0x80; tp->i_byte++; }
         else tp->bit_mask >>= 1;
 
-        /* última byte con used_bits (solo turbo/pure) */
-        if ((tp->blk[tp->i_blk].id==0x11) &&
+        /* último byte con used_bits (turbo 0x11 y pure data 0x14) */
+        if ((tp->blk[tp->i_blk].id==0x11 || tp->blk[tp->i_blk].id==0x14) &&
             tp->i_byte == tp->sub_len-1 && tp->p_used_bits>=1 && tp->p_used_bits<=8){
             /* si máscara cae fuera de bits usados, terminamos */
             if (tp->bit_mask < (1u<<(8 - tp->p_used_bits))){
