@@ -421,27 +421,182 @@ static void recalc_mmu(void)
     }
 }
 
-static void repaint_border(unsigned colour)
+/* ─────────────────────────────────────────────────────────────
+ * Cycle-accurate (t-state) border rasterizer
+ *
+ * Timing model (PAL, from interrupt = t 0):
+ *   48K  : 224 t-states/line, 312 lines/frame (69 888 t-states/frame)
+ *   128K/+3: 228 t-states/line, 312 lines/frame (71 136 t-states/frame)
+ *
+ * Visible frame layout (line numbers relative to INT):
+ *   lines   0 – 15  : top retrace   (invisible)
+ *   lines  16 – 47  : top border    → texture rows 0 .. BORDER-1
+ *   lines  48 – 63  : top overscan  (invisible)
+ *   lines  64 – 255 : screen        → texture rows BORDER .. BORDER+191
+ *                      (VRAM-rasterised at end of frame; only left/right
+ *                       border columns are written here)
+ *   lines 256 – 287 : bottom border → texture rows BORDER+192 .. HEIGHT-1
+ *   lines 288 – 311 : bottom retrace (invisible)
+ *
+ * Horizontal timing within a line (48K, 224 t-states/line):
+ *   t  0 – 23  : left border  (24 t-states → BORDER=32 pixels)
+ *   t 24 – 151 : active video (128 t-states → 256 pixels; not drawn here)
+ *   t 152 – 175: right border (24 t-states → BORDER=32 pixels)
+ *   t 176 – 223: horizontal flyback (invisible)
+ * For 128K/+3 (228 t-states/line) the left/right border spans are 26
+ * t-states each; the flyback accounts for the extra 4 t-states.
+ * ───────────────────────────────────────────────────────────── */
+
+/* First visible line numbers within the 312-line frame (from INT) */
+#define FIRST_TOP_LINE  16u   /* first top-border line  */
+#define FIRST_SCR_LINE  64u   /* first screen line      */
+#define FIRST_BOT_LINE  256u  /* first bottom-border line */
+
+/* T-states per scanline for the active model */
+static inline bool is_48k_model(void)
 {
-    border_color   = colour;
+    return model == ZX_48K_2 || model == ZX_48K_3;
+}
 
-    uint32_t *p = texturebits;
-    unsigned x,y;
-    uint32_t border = palette[colour];
+static inline unsigned tstates_per_line(void)
+{
+    return is_48k_model() ? 224u : 228u;
+}
 
-    for(y = 0; y < BORDER; y++)
-        for(x = 0; x < WIDTH; x++)
-            *p++ = border;
-    for(y = BORDER; y < BORDER + 192; y++) {
-        for(x = 0; x < BORDER; x++)
-            *p++ = border;
-        p += 256;
-        for(x = 0; x < BORDER; x++)
-            *p++ = border;
+/* Horizontal border timing: left/right border t-state span per model.
+ * Active video always spans 128 t-states (256 pixels at 2 t-states/pixel).
+ * Returns 24 for 48K or 26 for 128K/+3 – never 0. */
+static inline unsigned h_border_t(void)
+{
+    return is_48k_model() ? 24u : 26u;
+}
+
+/* Border rasterizer state */
+static uint64_t brd_frame_org = 0; /* absolute t-state at frame start    */
+static uint64_t brd_slice_org = 0; /* absolute t-state at slice start    */
+static uint64_t brd_drawn_to  = 0; /* absolute t-state drawn up to       */
+
+/* Advance border drawing from brd_drawn_to up to t_abs (absolute t-state).
+ * Uses the current border_color for all newly drawn pixels.
+ *
+ * Invariant: brd_frame_org <= brd_drawn_to <= t_abs.
+ * border_begin_frame() sets brd_frame_org = brd_drawn_to; after that
+ * brd_drawn_to only grows, so the unsigned subtractions below never wrap. */
+static void border_advance_to(uint64_t t_abs)
+{
+    if (t_abs <= brd_drawn_to)
+        return;
+    /* Safety: ensure we never underflow the frame-relative conversion */
+    if (brd_drawn_to < brd_frame_org)
+        brd_drawn_to = brd_frame_org;
+
+    unsigned tpl  = tstates_per_line();
+    unsigned hbt  = h_border_t();          /* left/right border span (t-states) */
+    unsigned hle  = hbt;                   /* left border end within line        */
+    unsigned hse  = hle + 128u;            /* screen end (= right border start)  */
+    unsigned hbe  = hse + hbt;             /* right border end (flyback starts)  */
+
+    uint32_t col  = palette[border_color & 0x0Fu];
+
+    /* Work in frame-relative t-states */
+    uint64_t ft     = brd_drawn_to - brd_frame_org;
+    uint64_t ft_end = t_abs        - brd_frame_org;
+
+    while (ft < ft_end) {
+        unsigned line   = (unsigned)(ft / tpl);
+        unsigned col_t  = (unsigned)(ft % tpl);
+
+        /* End of current line in frame-relative t-states */
+        uint64_t line_end_ft = (uint64_t)(line + 1u) * tpl;
+        uint64_t seg_end_ft  = (ft_end < line_end_ft) ? ft_end : line_end_ft;
+        unsigned col_t_end   = (unsigned)(seg_end_ft - (uint64_t)line * tpl);
+
+        /* Map line to texture row and row type */
+        int      tex_row  = -1;
+        int      row_type = -1; /* 0 = full-width top/bottom, 1 = screen left+right */
+
+        if (line >= FIRST_TOP_LINE && line < FIRST_TOP_LINE + BORDER) {
+            tex_row  = (int)(line - FIRST_TOP_LINE);
+            row_type = 0;
+        } else if (line >= FIRST_SCR_LINE && line < FIRST_SCR_LINE + 192u) {
+            tex_row  = (int)(BORDER + (line - FIRST_SCR_LINE));
+            row_type = 1;
+        } else if (line >= FIRST_BOT_LINE && line < FIRST_BOT_LINE + BORDER) {
+            tex_row  = (int)(BORDER + 192u + (line - FIRST_BOT_LINE));
+            row_type = 0;
+        } else {
+            /* Invisible line (retrace / overscan) – skip to next line */
+            ft = line_end_ft;
+            continue;
+        }
+
+        if (row_type == 0) {
+            /* Full-width top/bottom border row.
+             * Map t-states [0, hbe) linearly to pixels [0, WIDTH).
+             * Anything in the flyback region [hbe, tpl) is not drawn. */
+            if (col_t < hbe) {
+                unsigned ce = (col_t_end < hbe) ? col_t_end : hbe;
+                unsigned x0 = (unsigned)((uint64_t)col_t  * WIDTH / hbe);
+                unsigned x1 = (unsigned)((uint64_t)ce     * WIDTH / hbe);
+                if (x1 > (unsigned)WIDTH) x1 = (unsigned)WIDTH;
+                uint32_t *p = texturebits + tex_row * WIDTH + (int)x0;
+                for (unsigned x = x0; x < x1; x++)
+                    *p++ = col;
+            }
+        } else {
+            /* Screen row: only the left and right border columns are drawn.
+             *   Left border : t [0, hle)   → pixel x [0, BORDER)
+             *   Right border: t [hse, hbe) → pixel x [BORDER+256, WIDTH) */
+
+            /* Left border */
+            if (col_t < hle) {
+                unsigned ce = (col_t_end < hle) ? col_t_end : hle;
+                unsigned x0 = (unsigned)((uint64_t)col_t * BORDER / hle);
+                unsigned x1 = (unsigned)((uint64_t)ce    * BORDER / hle);
+                if (x1 > BORDER) x1 = BORDER;
+                uint32_t *p = texturebits + tex_row * WIDTH + (int)x0;
+                for (unsigned x = x0; x < x1; x++)
+                    *p++ = col;
+            }
+
+            /* Right border */
+            if (col_t_end > hse && col_t < hbe) {
+                unsigned cs = (col_t  > hse) ? col_t     : hse;
+                unsigned ce = (col_t_end < hbe) ? col_t_end : hbe;
+                unsigned x0 = (unsigned)(BORDER + 256u +
+                               (uint64_t)(cs - hse) * BORDER / hbt);
+                unsigned x1 = (unsigned)(BORDER + 256u +
+                               (uint64_t)(ce - hse) * BORDER / hbt);
+                if (x1 > (unsigned)WIDTH) x1 = (unsigned)WIDTH;
+                uint32_t *p = texturebits + tex_row * WIDTH + (int)x0;
+                for (unsigned x = x0; x < x1; x++)
+                    *p++ = col;
+            }
+        }
+
+        ft = seg_end_ft;
     }
-    for(y = 0; y < BORDER; y++)
-        for (x = 0; x < WIDTH; x++)
-            *p++ = border;
+
+    brd_drawn_to = t_abs;
+}
+
+/* Called once at the start of each 312-line frame (after INT fires). */
+static inline void border_begin_frame(void)
+{
+    brd_frame_org = brd_drawn_to;
+}
+
+/* Called before each Z80ExecuteTStates slice. */
+static inline void border_begin_slice(void)
+{
+    brd_slice_org = brd_drawn_to;
+}
+
+/* Called after each Z80ExecuteTStates slice. */
+static inline void border_end_slice(void)
+{
+    uint64_t t_now = brd_slice_org + (uint64_t)cpu_z80.tstates;
+    border_advance_to(t_now);
 }
 
 static void fdc_log(int debuglevel, char *fmt, va_list ap)
@@ -475,7 +630,10 @@ static void ula_write(uint8_t v)
     /* ▶️ Actualiza beeper (EAR|MIC) al instante actual */
     beeper_set_from_ula(v);
 
-    repaint_border(v & 7);
+    /* Catch up border drawing to the current t-state, then apply new color */
+    uint64_t t_now = brd_slice_org + (uint64_t)cpu_z80.tstates;
+    border_advance_to(t_now);
+    border_color = v & 7;
 }
 
 static uint8_t ula_read(uint16_t addr)
@@ -770,7 +928,8 @@ static SDL_Keycode keyboard[] = {
 static void run_scanlines(unsigned lines, unsigned blank)
 {
     unsigned i;
-    unsigned n = 224;   /* T States per op */
+    unsigned tpl = tstates_per_line(); /* PAL t-states/line: 224 (48K) or 228 (128K/+3) */
+    unsigned n   = tpl;
 
     blanked = blank;
 
@@ -778,16 +937,18 @@ static void run_scanlines(unsigned lines, unsigned blank)
         drawline = 0;
     /* Run scanlines */
     for (i = 0; i < lines; i++) {
-        /* Delimitamos porciones (beeper + cinta) alrededor de la ejecución */
+        /* Delimitamos porciones (beeper + cinta + border) alrededor de la ejecución */
         beeper_begin_slice();
+        border_begin_slice();
         tape_begin_slice(&tape);
         if (tzx_player) {
             tzx_begin_slice(tzx_player, tzx_frame_origin);
         }
 
-        n = 224 + 224 - Z80ExecuteTStates(&cpu_z80, n);
+        n = tpl + tpl - Z80ExecuteTStates(&cpu_z80, n);
 
         beeper_end_slice();
+        border_end_slice();
         tape_end_slice(&tape, &cpu_z80);
         if (tzx_player) {
             tzx_end_slice(tzx_player, &cpu_z80, &tzx_frame_origin);
@@ -1171,15 +1332,20 @@ int main(int argc, char *argv[])
                     F8 (play/pause pulses), F9 (rewind pulses) */
         handle_hotkeys(tapepath, tzx_path);
 
-        /* 192 scanlines framebuffer */
+        /*
+         * Run one full PAL frame (312 lines) with model-correct t-states/line.
+         * Frame layout from INT (t = 0):
+         *   lines   0 –  63 : top area  (retrace + BORDER=32 visible rows)
+         *   lines  64 – 255 : screen    (192 lines; VRAM rasterised at end)
+         *   lines 256 – 311 : bottom area (BORDER=32 visible rows + retrace)
+         */
+        border_begin_frame();
+        run_scanlines(64, 0);
         run_scanlines(192, 1);
-        /* and border */
         run_scanlines(56, 0);
         spectrum_rasterize();
         spectrum_render();
         Z80INT(&cpu_z80, 0xFF);
-        /* 64 scan lines of 224 T states for vblank etc */
-        run_scanlines(64, 0);
         poll_irq_event();
         frames++;
         /* Do a small block of I/O and delays */
