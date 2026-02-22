@@ -6,7 +6,7 @@
 #include <assert.h>
 
 /* Frecuencia de la CPU (t-states/seg). En 128K ~3.5469MHz; 48K ~3.5MHz.
-   Las rutinas de carga de cinta son por flancos, la pequeña diferencia es tolerada. */
+   Las rutinas de carga de cinta son por flancos, la pequeï¿½a diferencia es tolerada. */
 #ifndef TZX_CPU_TSTATES
 #define TZX_CPU_TSTATES 3546900.0
 #endif
@@ -31,7 +31,7 @@ typedef enum {
 
 typedef struct {
     uint8_t flags;                /* 0: invert; 1: same; 2: force low; 3: force high (bits 0..1) */
-    uint8_t npulses;              /* N máximo por símbolo */
+    uint8_t npulses;              /* N mï¿½ximo por sï¿½mbolo */
     uint16_t pulses[TZX_MAX_PULSES];
 } tzx_symbol_t;
 
@@ -41,11 +41,11 @@ struct tzx_player {
     size_t   len;
     uint8_t  ver_major, ver_minor;
 
-    /* índice de bloques */
+    /* Ã­ndice de bloques */
     tzx_block_ref_t* blk;
     int nblk;
 
-    /* reproducción */
+    /* reproducciÃ³n */
     int i_blk;
     int playing;
     int done;
@@ -55,7 +55,10 @@ struct tzx_player {
     uint64_t next_edge_at;     /* siguiente flanco programado */
     uint64_t pause_end_at;     /* fin de pausa activa */
 
-    /* sub-estado común a varios bloques */
+    /* callback de audio: llamado antes de cada cambio de nivel EAR */
+    tzx_ear_notify_fn notify_fn;
+
+    /* sub-estado comï¿½n a varios bloques */
     uint32_t sub_ofs;
     uint32_t sub_len;
     uint16_t p_pilot_len, p_sync1, p_sync2, p_0, p_1;
@@ -64,7 +67,7 @@ struct tzx_player {
     uint32_t p_pause_ms;
     uint32_t data_len;
 
-    /* iteración de bits */
+    /* iteraciï¿½n de bits */
     uint32_t i_byte;
     uint8_t  bit_mask;
     uint8_t  subpulse;
@@ -79,7 +82,7 @@ struct tzx_player {
     uint8_t  csw_ctype; /* 1 RLE; 2 Zero-RLE */
 
     /* 0x19 Generalized data */
-    /* parámetros */
+    /* parï¿½metros */
     uint32_t gen_blen;
     uint16_t gen_pause;
     uint32_t gen_totp, gen_totd;
@@ -90,17 +93,17 @@ struct tzx_player {
     /* alfabetos */
     tzx_symbol_t gen_symP[TZX_MAX_ALPHA], gen_symD[TZX_MAX_ALPHA];
     int      gen_loaded;
-    /* estado símbolo en curso */
+    /* estado sï¿½mbolo en curso */
     const tzx_symbol_t* gen_cur_sym;
-    int      gen_sym_ip;      /* índice de pulso dentro del símbolo */
+    int      gen_sym_ip;      /* ï¿½ndice de pulso dentro del sï¿½mbolo */
     int      gen_sym_rem;     /* pulsos restantes */
     /* pilot stream */
-    uint32_t gen_pilot_pos;   /* símbolo # actual dentro de totp */
+    uint32_t gen_pilot_pos;   /* sï¿½mbolo # actual dentro de totp */
     uint8_t  gen_pilot_sym_idx;
     uint16_t gen_pilot_rep_left;
     /* data stream */
-    int      gen_bits;        /* bits por símbolo (ceil log2(asd)) */
-    uint32_t gen_data_pos;    /* símbolo # consumidos */
+    int      gen_bits;        /* bits por sï¿½mbolo (ceil log2(asd)) */
+    uint32_t gen_data_pos;    /* sï¿½mbolo # consumidos */
     uint32_t gen_data_dsize;  /* bytes del stream de datos */
     uint32_t gen_data_ofs;    /* offset de lectura en dataStream */
     uint8_t  gen_data_byte;
@@ -118,7 +121,30 @@ static inline void tzx_set_error(tzx_player_t* tp, const char* msg){
     snprintf(tp->last_error, sizeof(tp->last_error), "%s", msg);
 }
 
-/* ================ API pública =============================== */
+/* Helper: notify host then flip EAR level.
+ * t_edge is the exact t-state at which the transition occurs. */
+#define TZX_EAR_TOGGLE(tp, t_edge) do { \
+    int _nl = (tp)->ear_level ^ 1; \
+    if ((tp)->notify_fn) (tp)->notify_fn((t_edge), _nl); \
+    (tp)->ear_level = _nl; \
+} while (0)
+
+/* Helper: notify host then assign EAR level (only if it changes). */
+#define TZX_EAR_SET(tp, t_edge, new_lv) do { \
+    int _nl = (int)(new_lv); \
+    if ((tp)->notify_fn && _nl != (tp)->ear_level) \
+        (tp)->notify_fn((t_edge), _nl); \
+    (tp)->ear_level = _nl; \
+} while (0)
+
+/* Maximum edges processed per tzx_advance_to() call.
+ * A full PAL frame at 50 Hz contains ~69 888 t-states; the shortest
+ * standard pulse is sync1 = 667 t-states, giving at most ~105 edges/frame.
+ * CSW / direct-recording blocks can have much shorter pulses â€“ 200 000
+ * provides a safe headroom while bounding worst-case runtime. */
+#define TZX_MAX_EDGES_PER_SLICE 200000
+
+/* ================ API pÃºblica =============================== */
 tzx_player_t* tzx_create(void){
     tzx_player_t* tp = (tzx_player_t*)calloc(1, sizeof(*tp));
     tp->ear_level = 1;
@@ -131,6 +157,10 @@ void tzx_destroy(tzx_player_t* tp){
     free(tp);
 }
 const char* tzx_last_error(const tzx_player_t* tp){ return tp?tp->last_error:""; }
+
+void tzx_set_ear_notify(tzx_player_t* tp, tzx_ear_notify_fn fn){
+    if (tp) tp->notify_fn = fn;
+}
 
 void tzx_play(tzx_player_t* tp){ if (tp){ tp->playing=1; } }
 void tzx_pause(tzx_player_t* tp, int pause_on){ if(tp){ tp->playing = pause_on?0:1; } }
@@ -262,13 +292,16 @@ int tzx_load_file(tzx_player_t* tp, const char* path)
     return 0;
 }
 
-/* ================ helpers de reproducción ===================== */
+/* ================ helpers de reproducciÃ³n ===================== */
 
 static inline const uint8_t* cur_payload(const tzx_player_t* tp, uint32_t* out_plen){
     uint32_t ofs = tp->blk[tp->i_blk].ofs + 1;
     *out_plen = (uint32_t)(tp->len - ofs);
     return &tp->buf[ofs];
 }
+
+/* Forward declaration needed by proc functions defined before tzx_next_block */
+static void tzx_next_block(tzx_player_t* tp);
 
 /* -------- 0x10 / 0x11 Standard / Turbo -------- */
 static void tzx_init_std_or_turbo(tzx_player_t* tp, int turbo)
@@ -302,14 +335,14 @@ static void tzx_init_std_or_turbo(tzx_player_t* tp, int turbo)
     tp->i_byte=0; tp->bit_mask=0x80; tp->subpulse=0;
 
     tp->pilot_left = tp->p_pilot_count;  /* >0 => pilot */
-    tp->ear_level ^= 1;                  /* primer flanco */
+    TZX_EAR_TOGGLE(tp, tp->slice_origin);  /* primer flanco */
     tp->next_edge_at = tp->slice_origin + tp->p_pilot_len;
 }
 static void tzx_proc_std_or_turbo(tzx_player_t* tp, uint64_t t_now)
 {
     if (tp->pilot_left > 0){
         if (t_now < tp->next_edge_at) return;
-        tp->ear_level ^= 1;
+        TZX_EAR_TOGGLE(tp, tp->next_edge_at);
         if (--tp->pilot_left > 0){
             tp->next_edge_at += tp->p_pilot_len;
         } else {
@@ -321,14 +354,14 @@ static void tzx_proc_std_or_turbo(tzx_player_t* tp, uint64_t t_now)
     }
     if (tp->pilot_left == -1){
         if (t_now < tp->next_edge_at) return;
-        tp->ear_level ^= 1;
+        TZX_EAR_TOGGLE(tp, tp->next_edge_at);
         tp->next_edge_at += tp->p_sync2;
         tp->pilot_left = -2;
         return;
     }
     if (tp->pilot_left == -2){
         if (t_now < tp->next_edge_at) return;
-        tp->ear_level ^= 1;
+        TZX_EAR_TOGGLE(tp, tp->next_edge_at);
         /* entra a bits */
         tp->pilot_left = -3;
         uint32_t plen; const uint8_t* p = cur_payload(tp,&plen);
@@ -339,7 +372,7 @@ static void tzx_proc_std_or_turbo(tzx_player_t* tp, uint64_t t_now)
     }
     /* bits */
     if (t_now < tp->next_edge_at) return;
-    tp->ear_level ^= 1;
+    TZX_EAR_TOGGLE(tp, tp->next_edge_at);
     uint32_t plen; const uint8_t* p = cur_payload(tp,&plen);
     uint8_t b = p[tp->sub_ofs + tp->i_byte];
     int bit = (b & tp->bit_mask)?1:0;
@@ -353,16 +386,17 @@ static void tzx_proc_std_or_turbo(tzx_player_t* tp, uint64_t t_now)
         if (tp->bit_mask==0x01){ tp->bit_mask=0x80; tp->i_byte++; }
         else tp->bit_mask >>= 1;
 
-        /* última byte con used_bits (solo turbo/pure) */
+        /* Ãºltima byte con used_bits (solo turbo/pure) */
         if ((tp->blk[tp->i_blk].id==0x11) &&
             tp->i_byte == tp->sub_len-1 && tp->p_used_bits>=1 && tp->p_used_bits<=8){
-            /* si máscara cae fuera de bits usados, terminamos */
+            /* si mÃ¡scara cae fuera de bits usados, terminamos */
             if (tp->bit_mask < (1u<<(8 - tp->p_used_bits))){
                 if (tp->p_pause_ms){
                     tp->pause_end_at = tp->next_edge_at + ms_to_tstates(tp->p_pause_ms);
                     tp->next_edge_at = 0;
+                    tzx_next_block(tp);  /* avanzar ya al siguiente bloque */
                 } else {
-                    tp->i_blk++;
+                    tzx_next_block(tp);
                 }
                 return;
             }
@@ -372,8 +406,9 @@ static void tzx_proc_std_or_turbo(tzx_player_t* tp, uint64_t t_now)
             if (tp->p_pause_ms){
                 tp->pause_end_at = tp->next_edge_at + ms_to_tstates(tp->p_pause_ms);
                 tp->next_edge_at = 0;
+                tzx_next_block(tp);  /* avanzar ya al siguiente bloque */
             } else {
-                tp->i_blk++;
+                tzx_next_block(tp);
             }
             return;
         }
@@ -392,16 +427,16 @@ static void tzx_init_pure_tone(tzx_player_t* tp)
     tp->p_pilot_len = rd_le16(p+0);
     tp->p_pilot_count = rd_le16(p+2);
     tp->pilot_left = (int)tp->p_pilot_count;
-    tp->ear_level ^= 1;
+    TZX_EAR_TOGGLE(tp, tp->slice_origin);
     tp->next_edge_at = tp->slice_origin + tp->p_pilot_len;
 }
 static void tzx_proc_pure_tone(tzx_player_t* tp, uint64_t t_now)
 {
-    if (tp->pilot_left<=0){ tp->i_blk++; return; }
+    if (tp->pilot_left<=0){ tzx_next_block(tp); return; }
     if (t_now < tp->next_edge_at) return;
-    tp->ear_level ^= 1;
+    TZX_EAR_TOGGLE(tp, tp->next_edge_at);
     if (--tp->pilot_left>0) tp->next_edge_at += tp->p_pilot_len;
-    else tp->i_blk++;
+    else tzx_next_block(tp);
 }
 
 /* -------- 0x13 Pulse sequence -------- */
@@ -413,7 +448,7 @@ static void tzx_init_pulse_seq(tzx_player_t* tp)
     if (1 + 2*np > plen){ tp->done=1; return; }
     tp->sub_ofs = 1; tp->sub_len = 1 + 2*np;
     tp->i_byte = 0;
-    tp->ear_level ^= 1;
+    TZX_EAR_TOGGLE(tp, tp->slice_origin);
     uint16_t t = rd_le16(p+tp->sub_ofs);
     tp->next_edge_at = tp->slice_origin + t;
 }
@@ -422,9 +457,9 @@ static void tzx_proc_pulse_seq(tzx_player_t* tp, uint64_t t_now)
     uint32_t plen; const uint8_t* p = cur_payload(tp,&plen);
     uint8_t np = p[0];
     if (t_now < tp->next_edge_at) return;
-    tp->ear_level ^= 1;
+    TZX_EAR_TOGGLE(tp, tp->next_edge_at);
     tp->i_byte++;
-    if (tp->i_byte >= np){ tp->i_blk++; return; }
+    if (tp->i_byte >= np){ tzx_next_block(tp); return; }
     uint16_t t = rd_le16(p+tp->sub_ofs + 2*tp->i_byte);
     tp->next_edge_at += t;
 }
@@ -443,20 +478,20 @@ static void tzx_init_pure_data(tzx_player_t* tp)
     tp->sub_ofs = 10; tp->sub_len = tp->data_len;
     tp->i_byte=0; tp->bit_mask=0x80; tp->subpulse=0;
 
-    tp->ear_level ^= 1;
+    TZX_EAR_TOGGLE(tp, tp->slice_origin);
     uint8_t b = p[tp->sub_ofs];
     int bit = (b & tp->bit_mask)?1:0;
     tp->next_edge_at = tp->slice_origin + (bit?tp->p_1:tp->p_0);
 }
 static void tzx_proc_pure_data(tzx_player_t* tp, uint64_t t_now)
 {
-    /* reutiliza lógica de turbo */
+    /* reutiliza lÃ³gica de turbo */
     tzx_proc_std_or_turbo(tp, t_now);
 }
 
 /* -------- 0x15 Direct recording -------- */
 
-/* Lee el bit i-ésimo (MSB-first dentro de cada byte) desde Direct Recording */
+/* Lee el bit i-ï¿½simo (MSB-first dentro de cada byte) desde Direct Recording */
 static inline int dr_get_bit(const uint8_t* base, uint32_t sub_ofs, uint32_t i)
 {
     uint32_t byte_i = i >> 3;          /* i / 8 */
@@ -465,7 +500,7 @@ static inline int dr_get_bit(const uint8_t* base, uint32_t sub_ofs, uint32_t i)
     return (b >> bit_i) & 1;
 }
 
-/* Devuelve la primera posición >= start_bit donde el bit cambia, o total_bits si no cambia */
+/* Devuelve la primera posiciï¿½n >= start_bit donde el bit cambia, o total_bits si no cambia */
 static inline uint32_t dr_scan_run(const uint8_t* base, uint32_t sub_ofs,
                                    uint32_t start_bit, uint32_t total_bits)
 {
@@ -489,41 +524,43 @@ static void tzx_init_direct(tzx_player_t* tp)
     if (8 + tp->data_len > plen){ tp->done=1; return; }
     tp->sub_ofs = 8; tp->sub_len = tp->data_len;
     tp->dr_ts_per_sample = tsps;
-    /* total bits = (len-1)*8 + used_bits (si 0 => 8 en último) */
+    /* total bits = (len-1)*8 + used_bits (si 0 => 8 en Ãºltimo) */
     uint8_t u = tp->p_used_bits ? tp->p_used_bits : 8;
     tp->dr_total_bits = (tp->sub_len? (tp->sub_len-1)*8 + u : 0);
     tp->dr_abs_bit = 0;
 
-    /* nivel inicial según primer bit (si hay datos) */
+    /* nivel inicial segÃºn primer bit (si hay datos) */
     if (tp->dr_total_bits > 0){
         uint8_t b0 = p[tp->sub_ofs];
-        tp->ear_level = (b0 & 0x80) ? 1 : 0;
-        /* programa primera muestra como mínimo */
+        TZX_EAR_SET(tp, tp->slice_origin, (b0 & 0x80) ? 1 : 0);
         tp->next_edge_at = tp->slice_origin + tp->dr_ts_per_sample;
     } else {
         /* sin datos: solo pausa */
         tp->next_edge_at = 0;
-        if (tp->p_pause_ms) tp->pause_end_at = tp->slice_origin + ms_to_tstates(tp->p_pause_ms);
-        else tp->i_blk++;
+        if (tp->p_pause_ms){
+            tp->pause_end_at = tp->slice_origin + ms_to_tstates(tp->p_pause_ms);
+            tzx_next_block(tp);  /* avanzar ya al siguiente bloque */
+        } else {
+            tzx_next_block(tp);
+        }
     }
 }
 
 static void tzx_proc_direct(tzx_player_t* tp, uint64_t t_now)
 {
-    if (tp->pause_end_at){
-        if (t_now >= tp->pause_end_at){ tp->pause_end_at=0; tp->i_blk++; }
-        return;
-    }
     if (tp->dr_abs_bit >= tp->dr_total_bits){
         if (tp->p_pause_ms){
             tp->pause_end_at = t_now + ms_to_tstates(tp->p_pause_ms);
             tp->next_edge_at = 0;
-        } else tp->i_blk++;
+            tzx_next_block(tp);  /* avanzar ya al siguiente bloque */
+        } else {
+            tzx_next_block(tp);
+        }
         return;
     }
     if (t_now < tp->next_edge_at) return;
 
-    /* Avanza un “run” de muestras iguales y programa el siguiente toggle */
+    /* Avanza un "run" de muestras iguales y programa el siguiente toggle */
     uint32_t plen; const uint8_t* p = cur_payload(tp,&plen);
 
     int cur = dr_get_bit(p, tp->sub_ofs, tp->dr_abs_bit);
@@ -533,7 +570,7 @@ static void tzx_proc_direct(tzx_player_t* tp, uint64_t t_now)
     tp->dr_abs_bit = i;
 
     /* Toggle de nivel al final del run */
-    tp->ear_level = cur ? 0 : 1;
+    TZX_EAR_SET(tp, tp->next_edge_at, cur ? 0 : 1);
     tp->next_edge_at = t_now + (uint64_t)run * (uint64_t)tp->dr_ts_per_sample;
 }
 
@@ -570,15 +607,11 @@ static void tzx_init_csw(tzx_player_t* tp)
     tp->sub_ofs = 14; tp->sub_len = blen;
     tp->i_byte = 0; tp->csw_ctype = ctype;
 
-    /* Programación diferida (se hará en proc) */
+    /* Programaciï¿½n diferida (se harï¿½ en proc) */
     tp->next_edge_at = 0;
 }
 static void tzx_proc_csw(tzx_player_t* tp, uint64_t t_now)
 {
-    if (tp->pause_end_at){
-        if (t_now >= tp->pause_end_at){ tp->pause_end_at=0; tp->i_blk++; }
-        return;
-    }
     if (tp->next_edge_at && t_now < tp->next_edge_at) return;
 
     uint32_t plen; const uint8_t* p = cur_payload(tp,&plen);
@@ -589,10 +622,13 @@ static void tzx_proc_csw(tzx_player_t* tp, uint64_t t_now)
         if (tp->p_pause_ms){
             tp->pause_end_at = t_now + ms_to_tstates(tp->p_pause_ms);
             tp->next_edge_at = 0;
-        } else tp->i_blk++;
+            tzx_next_block(tp);  /* avanzar ya al siguiente bloque */
+        } else {
+            tzx_next_block(tp);
+        }
         return;
     }
-    tp->ear_level ^= 1;
+    TZX_EAR_TOGGLE(tp, tp->next_edge_at ? tp->next_edge_at : t_now);
     tp->next_edge_at = t_now + (uint64_t)cnt * (uint64_t)tp->p_0;
     tp->i_byte = idx;
 }
@@ -658,10 +694,10 @@ static void gen_start_symbol(tzx_player_t* tp, const tzx_symbol_t* s, uint64_t t
 {
     /* aplicar flags de nivel */
     switch (s->flags & 3){
-        case 0: tp->ear_level ^= 1; break;
+        case 0: TZX_EAR_TOGGLE(tp, t_now); break;
         case 1: /* igual */ break;
-        case 2: tp->ear_level = 0; break;
-        case 3: tp->ear_level = 1; break;
+        case 2: TZX_EAR_SET(tp, t_now, 0); break;
+        case 3: TZX_EAR_SET(tp, t_now, 1); break;
     }
     tp->gen_cur_sym = s;
     tp->gen_sym_ip  = 0;
@@ -676,7 +712,7 @@ static void gen_start_symbol(tzx_player_t* tp, const tzx_symbol_t* s, uint64_t t
             return;
         }
     }
-    tp->gen_cur_sym = NULL; /* símbolo vacío */
+    tp->gen_cur_sym = NULL; /* sÃ­mbolo vacÃ­o */
     tp->next_edge_at = 0;
 }
 
@@ -684,18 +720,18 @@ static int gen_advance_symbol(tzx_player_t* tp, uint64_t t_now)
 {
     /* llamado cuando hemos alcanzado next_edge_at: hacemos toggle y buscamos siguiente pulso */
     if (!tp->gen_cur_sym) return 1; /* terminado */
-    tp->ear_level ^= 1;
+    TZX_EAR_TOGGLE(tp, tp->next_edge_at);
     while (tp->gen_sym_rem > 0){
         uint16_t dur = tp->gen_cur_sym->pulses[tp->gen_sym_ip++];
         tp->gen_sym_rem--;
         if (dur){
             tp->next_edge_at = t_now + dur;
-            return 0; /* sigue dentro del símbolo */
+            return 0; /* sigue dentro del sÃ­mbolo */
         }
     }
     tp->gen_cur_sym = NULL;
     tp->next_edge_at = 0;
-    return 1; /* símbolo terminado */
+    return 1; /* sÃ­mbolo terminado */
 }
 
 static int gen_read_pilot_entry(tzx_player_t* tp, uint8_t* out_sym_idx, uint16_t* out_rep)
@@ -732,7 +768,7 @@ static void tzx_init_gen(tzx_player_t* tp)
     tzx_parse_generalized_tables(tp);
     tp->next_edge_at = 0;
     tp->pause_end_at = 0;
-    /* arrancar primer símbolo si hay pilot */
+    /* arrancar primer sï¿½mbolo si hay pilot */
     if (tp->gen_phase==0){
         /* leer primera entrada pilot (idx+rep) */
         uint8_t sidx; uint16_t rep;
@@ -771,7 +807,7 @@ static void tzx_proc_gen(tzx_player_t* tp, uint64_t t_now)
                     gen_start_symbol(tp, &tp->gen_symP[tp->gen_pilot_sym_idx], t_now);
                 }
             } else {
-                /* aún quedan repeticiones del mismo símbolo */
+                /* aï¿½n quedan repeticiones del mismo sï¿½mbolo */
                 gen_start_symbol(tp, &tp->gen_symP[tp->gen_pilot_sym_idx], t_now);
             }
             return;
@@ -793,44 +829,45 @@ static void tzx_proc_gen(tzx_player_t* tp, uint64_t t_now)
             if (tp->gen_pause){
                 tp->pause_end_at = t_now + ms_to_tstates(tp->gen_pause);
                 tp->next_edge_at = 0; tp->gen_pause = 0;
+                tzx_next_block(tp);  /* avanzar ya al siguiente bloque */
                 return;
             } else {
-                tp->i_blk++; return;
+                tzx_next_block(tp); return;
             }
         }
     }
 
-    /* Si hay un edge programado y aún no hemos llegado, esperamos */
+    /* Si hay un edge programado y aï¿½n no hemos llegado, esperamos */
     if (tp->next_edge_at && t_now < tp->next_edge_at) return;
 
-    /* Consumimos un pulso del símbolo actual */
+    /* Consumimos un pulso del sï¿½mbolo actual */
     if (tp->gen_cur_sym){
         int done = gen_advance_symbol(tp, t_now);
-        if (!done) return; /* sigue en el mismo símbolo (siguiente pulso ya programado) */
-        /* símbolo terminado: pasamos a repetir o al siguiente */
+        if (!done) return; /* sigue en el mismo sï¿½mbolo (siguiente pulso ya programado) */
+        /* sï¿½mbolo terminado: pasamos a repetir o al siguiente */
         if (tp->gen_phase==0){
             if (tp->gen_pilot_rep_left>0) tp->gen_pilot_rep_left--;
             if (tp->gen_pilot_rep_left>0){
-                /* repetir el mismo símbolo */
+                /* repetir el mismo sï¿½mbolo */
                 return;
             } else {
                 /* siguiente entrada */
                 return;
             }
         } else if (tp->gen_phase==1){
-            /* siguiente símbolo de datos */
+            /* siguiente sï¿½mbolo de datos */
             return;
         }
     }
 
-    /* Si no hay símbolo y no hay edge, avanzamos de fase en próxima llamada */
+    /* Si no hay sï¿½mbolo y no hay edge, avanzamos de fase en prï¿½xima llamada */
 }
 
 /* ================ control de flujo y avance global ============ */
 
 static void tzx_next_block(tzx_player_t* tp){ tp->i_blk++; }
 
-/* Aplica bloques de control que no generan señal inmediatamente */
+/* Aplica bloques de control que no generan seï¿½al inmediatamente */
 static int tzx_apply_control_blocks(tzx_player_t* tp, int* jumped)
 {
     *jumped = 0;
@@ -850,7 +887,7 @@ static int tzx_apply_control_blocks(tzx_player_t* tp, int* jumped)
             if (target >= tp->nblk){ tp->done=1; return 0; }
             tp->i_blk = target; *jumped=1; break;
         }
-        case 0x24: { /* loop start (no pila completa aquí; se puede ampliar) */
+        case 0x24: { /* loop start (no pila completa aquï¿½; se puede ampliar) */
             tzx_next_block(tp); break;
         }
         case 0x25: { /* loop end */
@@ -866,10 +903,10 @@ static int tzx_apply_control_blocks(tzx_player_t* tp, int* jumped)
         }
         case 0x27: tzx_next_block(tp); break; /* return */
         case 0x28: tzx_next_block(tp); break; /* select */
-        case 0x2A: tzx_next_block(tp); break; /* stop 48K (ignorado aquí) */
+        case 0x2A: tzx_next_block(tp); break; /* stop 48K (ignorado aquï¿½) */
         case 0x2B: { /* set signal */
             if (plen<5){ tp->done=1; return -1; }
-            tp->ear_level = p[4]?1:0;
+            TZX_EAR_SET(tp, tp->slice_origin, p[4]?1:0);
             tzx_next_block(tp); break;
         }
         case 0x20: { /* pause/stop */
@@ -882,7 +919,7 @@ static int tzx_apply_control_blocks(tzx_player_t* tp, int* jumped)
             return 0;
         }
         default:
-            return 0; /* productor de señal */
+            return 0; /* productor de seï¿½al */
         }
     }
     tp->done=1;
@@ -893,57 +930,97 @@ static void tzx_advance_to(tzx_player_t* tp, uint64_t t_now)
 {
     if (!tzx_active(tp)) return;
 
-    if (tp->pause_end_at){
-        if (t_now >= tp->pause_end_at) tp->pause_end_at=0;
-        else return;
-    }
+    /* Process ALL pending edges up to t_now in one call (like tape_advance_to).
+     * prev_blk is local so sub-state is cleared whenever i_blk changes. */
+    int prev_blk = tp->i_blk;
+    int safety = TZX_MAX_EDGES_PER_SLICE;
 
-    int jumped=0;
-    if (tzx_apply_control_blocks(tp,&jumped)!=0) return;
-    if (tp->done) return;
+    while (tzx_active(tp) && safety-- > 0) {
 
-    uint8_t id = tp->blk[tp->i_blk].id;
-    if (tp->sub_ofs==0 && tp->sub_len==0 && tp->next_edge_at==0 && tp->pilot_left==0 && tp->gen_cur_sym==NULL){
-        switch(id){
-        case 0x10: tzx_init_std_or_turbo(tp,0); break;
-        case 0x11: tzx_init_std_or_turbo(tp,1); break;
-        case 0x12: tzx_init_pure_tone(tp); break;
-        case 0x13: tzx_init_pulse_seq(tp); break;
-        case 0x14: tzx_init_pure_data(tp); break;
-        case 0x15: tzx_init_direct(tp); break;
-        case 0x18: tzx_init_csw(tp); break;
-        case 0x19: tzx_init_gen(tp); break;
-        default: tzx_next_block(tp); return;
+        /* 1. Clear sub-state whenever block index changed */
+        if (tp->i_blk != prev_blk) {
+            tp->sub_ofs = tp->sub_len = 0;
+            tp->pilot_left = 0;
+            tp->i_byte = 0; tp->bit_mask = 0x80; tp->subpulse = 0;
+            tp->gen_cur_sym = NULL;
+            prev_blk = tp->i_blk;
         }
-    }
 
-    switch(id){
-    case 0x10: case 0x11: tzx_proc_std_or_turbo(tp,t_now); break;
-    case 0x12: tzx_proc_pure_tone(tp,t_now); break;
-    case 0x13: tzx_proc_pulse_seq(tp,t_now); break;
-    case 0x14: tzx_proc_pure_data(tp,t_now); break;
-    case 0x15: tzx_proc_direct(tp,t_now); break;
-    case 0x18: tzx_proc_csw(tp,t_now); break;
-    case 0x19: tzx_proc_gen(tp,t_now); break;
-    default: tzx_next_block(tp); break;
-    }
+        /* 2. Handle active pause */
+        if (tp->pause_end_at) {
+            if (t_now >= tp->pause_end_at)
+                tp->pause_end_at = 0;
+            else
+                break;  /* still waiting for pause to end */
+        }
 
-    /* Si hemos pasado de bloque, limpia sub-estado */
-    static int prev_blk = -1;
-    if (tp->i_blk >= tp->nblk){ tp->done=1; return; }
-    if (prev_blk != tp->i_blk){
-        tp->sub_ofs=tp->sub_len=0; tp->pilot_left=0;
-        tp->i_byte=0; tp->bit_mask=0x80; tp->subpulse=0;
-        tp->gen_cur_sym=NULL; /* no tocamos next_edge_at aquí; depende del init */
-        prev_blk = tp->i_blk;
+        if (tp->i_blk >= tp->nblk) { tp->done = 1; break; }
+
+        /* 3. Skip control/info blocks; may set pause_end_at (block already advanced) */
+        int jumped = 0;
+        if (tzx_apply_control_blocks(tp, &jumped) != 0) break;
+        if (tp->done) break;
+
+        /* If control blocks changed i_blk, restart loop to clear sub-state */
+        if (tp->i_blk != prev_blk) continue;
+
+        uint8_t id = tp->blk[tp->i_blk].id;
+
+        /* 4. Initialize new signal block (anchored to t_now for accurate timing) */
+        if (tp->sub_ofs == 0 && tp->sub_len == 0 && tp->next_edge_at == 0 &&
+            tp->pilot_left == 0 && tp->gen_cur_sym == NULL) {
+            tp->slice_origin = t_now;  /* anchor first-edge to current time */
+            switch (id) {
+            case 0x10: tzx_init_std_or_turbo(tp, 0); break;
+            case 0x11: tzx_init_std_or_turbo(tp, 1); break;
+            case 0x12: tzx_init_pure_tone(tp); break;
+            case 0x13: tzx_init_pulse_seq(tp); break;
+            case 0x14: tzx_init_pure_data(tp); break;
+            case 0x15: tzx_init_direct(tp); break;
+            case 0x18: tzx_init_csw(tp); break;
+            case 0x19: tzx_init_gen(tp); break;
+            default:   tzx_next_block(tp); continue;
+            }
+            /* If init triggered a pause (e.g. no-data direct), restart loop */
+            if (tp->pause_end_at) continue;
+        }
+
+        /* 5. If next event is in the future, done for now */
+        if (tp->next_edge_at != 0 && t_now < tp->next_edge_at) break;
+
+        /* 6. Stall guard: track state before proc */
+        int      old_blk = tp->i_blk;
+        uint64_t old_nea = tp->next_edge_at;
+        uint64_t old_pea = tp->pause_end_at;
+
+        /* 7. Process one edge / state transition */
+        switch (id) {
+        case 0x10: case 0x11: tzx_proc_std_or_turbo(tp, t_now); break;
+        case 0x12: tzx_proc_pure_tone(tp, t_now); break;
+        case 0x13: tzx_proc_pulse_seq(tp, t_now); break;
+        case 0x14: tzx_proc_pure_data(tp, t_now); break;
+        case 0x15: tzx_proc_direct(tp, t_now); break;
+        case 0x18: tzx_proc_csw(tp, t_now); break;
+        case 0x19: tzx_proc_gen(tp, t_now); break;
+        default:   tzx_next_block(tp); break;
+        }
+
+        if (tp->i_blk >= tp->nblk) { tp->done = 1; break; }
+
+        /* 8. Stall guard: nothing changed â†’ stop to avoid infinite loop */
+        if (tp->i_blk == old_blk &&
+            tp->next_edge_at == old_nea &&
+            tp->pause_end_at == old_pea)
+            break;
     }
 }
 
-/* ================ Hooks de porción ============================ */
+/* ================ Hooks de porciÃ³n ============================ */
 void tzx_begin_slice(tzx_player_t* tp, uint64_t global_frame_origin)
 {
     if (!tp) return;
-    tp->slice_origin = tp->frame_origin = global_frame_origin;
+    tp->slice_origin = global_frame_origin;
+    tp->frame_origin = global_frame_origin;
 }
 void tzx_end_slice(tzx_player_t* tp, const Z80Context* cpu, uint64_t* io_new_frame_origin)
 {
