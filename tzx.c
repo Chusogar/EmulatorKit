@@ -12,6 +12,17 @@
 #define TZX_CPU_TSTATES 3546900.0
 #endif
 
+/* ================= Debug tracing ================= */
+#ifndef TZX_TRACE
+#define TZX_TRACE 0
+#endif
+
+#if TZX_TRACE
+#define TZX_TRACEF(...) printf(__VA_ARGS__)
+#else
+#define TZX_TRACEF(...) ((void)0)
+#endif
+
 /* ================= Utilidades LE ================= */
 static inline uint16_t rd_le16(const uint8_t* p){ return (uint16_t)(p[0] | (p[1]<<8)); }
 static inline uint32_t rd_le24(const uint8_t* p){ return (uint32_t)(p[0] | (p[1]<<8) | (p[2]<<16)); }
@@ -21,6 +32,7 @@ static inline uint32_t rd_le32(const uint8_t* p){ return (uint32_t)(p[0] | (p[1]
 typedef struct {
     uint8_t id;
     uint32_t ofs;  /* offset del bloque (ID incluido) dentro de buf */
+    uint32_t len;  /* longitud total del bloque (ID + payload) */
 } tzx_block_ref_t;
 
 typedef enum {
@@ -262,7 +274,7 @@ static int tzx_build_block_index(tzx_player_t* tp)
         }
         if (p+advance > tp->len) goto trunc;
         if (n==cap){ cap*=2; tzx_block_ref_t* nv=(tzx_block_ref_t*)realloc(v,cap*sizeof(*nv)); if(!nv){free(v);tzx_set_error(tp,"mem");return -1;} v=nv; }
-        v[n].id = id; v[n].ofs = (uint32_t)start; n++;
+        v[n].id = id; v[n].ofs = (uint32_t)start; v[n].len = (uint32_t)(1 + advance); n++;
         p += advance;
     }
     tp->blk = v; tp->nblk = n;
@@ -270,6 +282,153 @@ static int tzx_build_block_index(tzx_player_t* tp)
 trunc:
     free(v); tzx_set_error(tp,"TZX truncado"); return -1;
 }
+
+/* ================ TZX trace helpers (compiled only when TZX_TRACE) ======== */
+#if TZX_TRACE
+
+static const char* tzx_block_id_name(uint8_t id)
+{
+    switch(id){
+    case 0x10: return "Standard speed data";
+    case 0x11: return "Turbo speed data";
+    case 0x12: return "Pure tone";
+    case 0x13: return "Pulse sequence";
+    case 0x14: return "Pure data";
+    case 0x15: return "Direct recording";
+    case 0x18: return "CSW recording";
+    case 0x19: return "Generalized data";
+    case 0x20: return "Pause/Stop";
+    case 0x21: return "Group start";
+    case 0x22: return "Group end";
+    case 0x23: return "Jump to block";
+    case 0x24: return "Loop start";
+    case 0x25: return "Loop end";
+    case 0x26: return "Call sequence";
+    case 0x27: return "Return from sequence";
+    case 0x28: return "Select block";
+    case 0x2A: return "Stop tape if in 48K mode";
+    case 0x2B: return "Set signal level";
+    case 0x30: return "Text description";
+    case 0x31: return "Message block";
+    case 0x32: return "Archive info";
+    case 0x33: return "Hardware type";
+    case 0x35: return "Custom info";
+    case 0x5A: return "Glue block";
+    default:   return "Unknown";
+    }
+}
+
+static void tzx_trace_block_details(const tzx_player_t* tp, int idx)
+{
+    const tzx_block_ref_t* ref = &tp->blk[idx];
+    const uint8_t* p = &tp->buf[ref->ofs + 1]; /* payload */
+    uint32_t plen = (ref->len > 1) ? (ref->len - 1) : 0;
+
+    switch(ref->id){
+    case 0x10:
+        if (plen >= 4)
+            TZX_TRACEF("    pause=%ums datalen=%u\n", rd_le16(p), rd_le16(p+2));
+        break;
+    case 0x11:
+        if (plen >= 18)
+            TZX_TRACEF("    pilot=%u sync1=%u sync2=%u p0=%u p1=%u pilotcnt=%u usedbits=%u pause=%ums datalen=%u\n",
+                rd_le16(p), rd_le16(p+2), rd_le16(p+4), rd_le16(p+6), rd_le16(p+8),
+                rd_le16(p+10), p[12], rd_le16(p+13), rd_le24(p+15));
+        break;
+    case 0x12:
+        if (plen >= 4)
+            TZX_TRACEF("    pulselen=%u pulsecount=%u\n", rd_le16(p), rd_le16(p+2));
+        break;
+    case 0x13:
+        if (plen >= 1)
+            TZX_TRACEF("    npulses=%u\n", p[0]);
+        break;
+    case 0x14:
+        if (plen >= 10)
+            TZX_TRACEF("    p0=%u p1=%u usedbits=%u pause=%ums datalen=%u\n",
+                rd_le16(p), rd_le16(p+2), p[4], rd_le16(p+5), rd_le24(p+7));
+        break;
+    case 0x15:
+        if (plen >= 8)
+            TZX_TRACEF("    tsps=%u pause=%ums usedbits=%u datalen=%u\n",
+                rd_le16(p), rd_le16(p+2), p[4], rd_le24(p+5));
+        break;
+    case 0x18:
+        if (plen >= 14)
+            TZX_TRACEF("    blen=%u pause=%ums rate=%u ctype=%u npulses=%u\n",
+                rd_le32(p), rd_le16(p+4), rd_le24(p+6), p[9], rd_le32(p+10));
+        break;
+    case 0x19:
+        if (plen >= 18)
+            TZX_TRACEF("    blen=%u pause=%ums totp=%u npp=%u asp=%u totd=%u npd=%u asd=%u\n",
+                rd_le32(p), rd_le16(p+4), rd_le32(p+6), p[10], p[11],
+                rd_le32(p+12), p[16], p[17]);
+        break;
+    case 0x20:
+        if (plen >= 2)
+            TZX_TRACEF("    pause_ms=%u%s\n", rd_le16(p), rd_le16(p)==0?" (STOP)":"");
+        break;
+    case 0x21:
+        if (plen >= 1){
+            uint8_t slen = p[0];
+            if (plen >= (uint32_t)(1 + slen))
+                TZX_TRACEF("    name=\"%.*s\"\n", slen, p+1);
+        }
+        break;
+    case 0x23:
+        if (plen >= 2)
+            TZX_TRACEF("    rel_jump=%d\n", (int)(int16_t)rd_le16(p));
+        break;
+    case 0x24:
+        if (plen >= 2)
+            TZX_TRACEF("    count=%u\n", rd_le16(p));
+        break;
+    case 0x26:
+        if (plen >= 2)
+            TZX_TRACEF("    ncalls=%u\n", rd_le16(p));
+        break;
+    case 0x28:
+        if (plen >= 2)
+            TZX_TRACEF("    nselections=%u\n", rd_le16(p));
+        break;
+    case 0x2B:
+        if (plen >= 5)
+            TZX_TRACEF("    level=%u\n", p[4]);
+        break;
+    case 0x30:
+        if (plen >= 1){
+            uint8_t slen = p[0];
+            if (plen >= (uint32_t)(1 + slen))
+                TZX_TRACEF("    text=\"%.*s\"\n", slen, p+1);
+        }
+        break;
+    case 0x31:
+        if (plen >= 2){
+            uint8_t slen = p[1];
+            if (plen >= (uint32_t)(2 + slen))
+                TZX_TRACEF("    display_time=%us text=\"%.*s\"\n", p[0], slen, p+2);
+        }
+        break;
+    default:
+        break;
+    }
+}
+
+static void tzx_trace_block_list(const tzx_player_t* tp, const char* path)
+{
+    TZX_TRACEF("[TZX] Loaded \"%s\" ver %u.%u  blocks=%d\n",
+        path, tp->ver_major, tp->ver_minor, tp->nblk);
+    TZX_TRACEF("[TZX] %-4s  %-6s  %-5s  %s  %s\n",
+        "IDX", "OFFSET", "LEN", "ID  ", "Description");
+    for (int i = 0; i < tp->nblk; i++){
+        const tzx_block_ref_t* b = &tp->blk[i];
+        TZX_TRACEF("[TZX] #%-3d  0x%04X  %-5u  0x%02X  %s\n",
+            i, b->ofs, b->len, b->id, tzx_block_id_name(b->id));
+        tzx_trace_block_details(tp, i);
+    }
+}
+
+#endif /* TZX_TRACE */
 
 int tzx_load_file(tzx_player_t* tp, const char* path)
 {
@@ -287,6 +446,10 @@ int tzx_load_file(tzx_player_t* tp, const char* path)
     free(tp->blk); tp->blk=NULL; tp->nblk=0;
 
     if (tzx_build_block_index(tp)!=0) return -1;
+
+#if TZX_TRACE
+    tzx_trace_block_list(tp, path);
+#endif
 
     tzx_rewind(tp);
     tzx_play(tp);
@@ -876,44 +1039,81 @@ static int tzx_apply_control_blocks(tzx_player_t* tp, int* jumped)
         uint8_t id = tp->blk[tp->i_blk].id;
         uint32_t plen; const uint8_t* p = cur_payload(tp,&plen);
         switch(id){
-        case 0x21: case 0x22: case 0x30: case 0x31: case 0x32:
-        case 0x33: case 0x35: case 0x5A:
+        case 0x21:
+            if (plen>=1 && plen>=(uint32_t)(1+p[0])){ TZX_TRACEF("[TZX] #%d/%-3d 0x21 Group start: \"%.*s\"\n", tp->i_blk, tp->nblk, p[0], p+1); }
+            tzx_next_block(tp); break;
+        case 0x22:
+            TZX_TRACEF("[TZX] #%d/%-3d 0x22 Group end\n", tp->i_blk, tp->nblk);
+            tzx_next_block(tp); break;
+        case 0x30:
+            if (plen>=1 && plen>=(uint32_t)(1+p[0])){ TZX_TRACEF("[TZX] #%d/%-3d 0x30 Text: \"%.*s\"\n", tp->i_blk, tp->nblk, p[0], p+1); }
+            tzx_next_block(tp); break;
+        case 0x31:
+            if (plen>=2 && plen>=(uint32_t)(2+p[1])){ TZX_TRACEF("[TZX] #%d/%-3d 0x31 Message: \"%.*s\"\n", tp->i_blk, tp->nblk, p[1], p+2); }
+            tzx_next_block(tp); break;
+        case 0x32:
+            TZX_TRACEF("[TZX] #%d/%-3d 0x32 Archive info\n", tp->i_blk, tp->nblk);
+            tzx_next_block(tp); break;
+        case 0x33:
+            TZX_TRACEF("[TZX] #%d/%-3d 0x33 Hardware type\n", tp->i_blk, tp->nblk);
+            tzx_next_block(tp); break;
+        case 0x35:
+            TZX_TRACEF("[TZX] #%d/%-3d 0x35 Custom info\n", tp->i_blk, tp->nblk);
+            tzx_next_block(tp); break;
+        case 0x5A:
+            TZX_TRACEF("[TZX] #%d/%-3d 0x5A Glue block\n", tp->i_blk, tp->nblk);
             tzx_next_block(tp); break;
         case 0x23: {
             if (plen<2){ tp->done=1; return -1; }
             int16_t rel = (int16_t)rd_le16(p+0);
             if (rel==0){ tp->done=1; return 0; }
             int target = tp->i_blk + rel + 1;
+            TZX_TRACEF("[TZX] #%d/%-3d 0x23 Jump rel=%d -> #%d\n", tp->i_blk, tp->nblk, rel, target);
             if (target < 0) target = 0;
             if (target >= tp->nblk){ tp->done=1; return 0; }
             tp->i_blk = target; *jumped=1; break;
         }
         case 0x24: { /* loop start (no pila completa aquí; se puede ampliar) */
+            if (plen>=2){ TZX_TRACEF("[TZX] #%d/%-3d 0x24 Loop start count=%u\n", tp->i_blk, tp->nblk, rd_le16(p)); }
             tzx_next_block(tp); break;
         }
         case 0x25: { /* loop end */
+            TZX_TRACEF("[TZX] #%d/%-3d 0x25 Loop end\n", tp->i_blk, tp->nblk);
             tzx_next_block(tp); break;
         }
         case 0x26: { /* call (simplificado: saltamos a la primera llamada) */
             if (plen<2){ tp->done=1; return -1; }
             if (plen>=4){
                 int16_t rel = (int16_t)rd_le16(p+2);
-                tp->i_blk = tp->i_blk + rel + 1; *jumped=1;
+                int target = tp->i_blk + rel + 1;
+                TZX_TRACEF("[TZX] #%d/%-3d 0x26 Call rel=%d -> #%d\n", tp->i_blk, tp->nblk, rel, target);
+                tp->i_blk = target; *jumped=1;
             } else tzx_next_block(tp);
             break;
         }
-        case 0x27: tzx_next_block(tp); break; /* return */
-        case 0x28: tzx_next_block(tp); break; /* select */
-        case 0x2A: tzx_next_block(tp); break; /* stop 48K (ignorado aquí) */
+        case 0x27:
+            TZX_TRACEF("[TZX] #%d/%-3d 0x27 Return from sequence\n", tp->i_blk, tp->nblk);
+            tzx_next_block(tp); break; /* return */
+        case 0x28:
+            TZX_TRACEF("[TZX] #%d/%-3d 0x28 Select block\n", tp->i_blk, tp->nblk);
+            tzx_next_block(tp); break; /* select */
+        case 0x2A:
+            TZX_TRACEF("[TZX] #%d/%-3d 0x2A Stop tape (48K)\n", tp->i_blk, tp->nblk);
+            tzx_next_block(tp); break; /* stop 48K (ignorado aquí) */
         case 0x2B: { /* set signal */
             if (plen<5){ tp->done=1; return -1; }
+            TZX_TRACEF("[TZX] #%d/%-3d 0x2B Set signal level=%u\n", tp->i_blk, tp->nblk, p[4]);
             TZX_EAR_SET(tp, tp->slice_origin, p[4]?1:0);
             tzx_next_block(tp); break;
         }
         case 0x20: { /* pause/stop */
             if (plen<2){ tp->done=1; return -1; }
             uint16_t ms = rd_le16(p+0);
-            if (ms==0){ tp->done=1; return 0; }
+            if (ms==0){
+                TZX_TRACEF("[TZX] #%d/%-3d 0x20 Stop tape\n", tp->i_blk, tp->nblk);
+                tp->done=1; return 0;
+            }
+            TZX_TRACEF("[TZX] #%d/%-3d 0x20 Pause %ums\n", tp->i_blk, tp->nblk, ms);
             tp->pause_end_at = tp->slice_origin + ms_to_tstates(ms);
             tp->next_edge_at = 0;
             tzx_next_block(tp);
@@ -971,6 +1171,10 @@ static void tzx_advance_to(tzx_player_t* tp, uint64_t t_now)
         if (tp->sub_ofs == 0 && tp->sub_len == 0 && tp->next_edge_at == 0 &&
             tp->pilot_left == 0 && tp->gen_cur_sym == NULL) {
             tp->slice_origin = t_now;  /* anchor first-edge to current time */
+#if TZX_TRACE
+            TZX_TRACEF("[TZX] #%d/%-3d 0x%02X %s  init\n",
+                tp->i_blk, tp->nblk, id, tzx_block_id_name(id));
+#endif
             switch (id) {
             case 0x10: tzx_init_std_or_turbo(tp, 0); break;
             case 0x11: tzx_init_std_or_turbo(tp, 1); break;
