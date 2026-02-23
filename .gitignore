@@ -4,6 +4,7 @@
 *.BIN
 *.dSYM
 my.cf
+_codeql_detected_source_root
 
 .deps
 
