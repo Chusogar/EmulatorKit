@@ -14,7 +14,7 @@
 
 /* ================= Debug tracing ================= */
 #ifndef TZX_TRACE
-#define TZX_TRACE 1
+#define TZX_TRACE 0
 #endif
 
 #if TZX_TRACE
@@ -697,11 +697,20 @@ static void tzx_init_direct(tzx_player_t* tp)
     tp->dr_total_bits = (tp->sub_len? (tp->sub_len-1)*8 + u : 0);
     tp->dr_abs_bit = 0;
 
-    /* nivel inicial según primer bit (si hay datos) */
+    /* nivel inicial según primer bit; programa el primer flanco de nivel
+     * al final del primer "run" (muestras consecutivas iguales) para que
+     * el timing sea preciso desde la primera transición. */
     if (tp->dr_total_bits > 0){
-        uint8_t b0 = p[tp->sub_ofs];
-        TZX_EAR_SET(tp, tp->slice_origin, (b0 & 0x80) ? 1 : 0);
-        tp->next_edge_at = tp->slice_origin + tp->dr_ts_per_sample;
+        int first_bit = (p[tp->sub_ofs] & 0x80) ? 1 : 0;
+        TZX_EAR_SET(tp, tp->slice_origin, first_bit);
+        /* Scan the initial run; dr_abs_bit points to the first transition */
+        uint32_t end_run = dr_scan_run(p, tp->sub_ofs, 0, tp->dr_total_bits);
+        tp->dr_abs_bit = end_run;
+        tp->next_edge_at = tp->slice_origin + (uint64_t)end_run * tp->dr_ts_per_sample;
+        TZX_TRACEF("[TZX:DR] init: tsps=%u total_bits=%u used_bits=%u pause=%ums"
+                   " first_bit=%d first_run_end=%u\n",
+            tp->dr_ts_per_sample, tp->dr_total_bits, tp->p_used_bits,
+            tp->p_pause_ms, first_bit, end_run);
     } else {
         /* sin datos: solo pausa */
         tp->next_edge_at = 0;
@@ -716,9 +725,14 @@ static void tzx_init_direct(tzx_player_t* tp)
 
 static void tzx_proc_direct(tzx_player_t* tp, uint64_t t_now)
 {
+    if (t_now < tp->next_edge_at) return;
+
     if (tp->dr_abs_bit >= tp->dr_total_bits){
+        /* End of data: anchor pause to the last scheduled edge (no drift) */
+        TZX_TRACEF("[TZX:DR] end of data at t=%llu pause=%ums\n",
+            (unsigned long long)tp->next_edge_at, tp->p_pause_ms);
         if (tp->p_pause_ms){
-            tp->pause_end_at = t_now + ms_to_tstates(tp->p_pause_ms);
+            tp->pause_end_at = tp->next_edge_at + ms_to_tstates(tp->p_pause_ms);
             tp->next_edge_at = 0;
             tzx_next_block(tp);  /* avanzar ya al siguiente bloque */
         } else {
@@ -726,20 +740,24 @@ static void tzx_proc_direct(tzx_player_t* tp, uint64_t t_now)
         }
         return;
     }
-    if (t_now < tp->next_edge_at) return;
 
-    /* Avanza un "run" de muestras iguales y programa el siguiente toggle */
+    /* Toggle to the new level at the previously scheduled edge time (no drift) */
     uint32_t plen; const uint8_t* p = cur_payload(tp,&plen);
+    uint32_t start_bit = tp->dr_abs_bit;
+    int new_level = dr_get_bit(p, tp->sub_ofs, start_bit);
+    uint64_t edge_t = tp->next_edge_at;
+    TZX_EAR_SET(tp, edge_t, new_level);
 
-    int cur = dr_get_bit(p, tp->sub_ofs, tp->dr_abs_bit);
-    uint32_t i = dr_scan_run(p, tp->sub_ofs, tp->dr_abs_bit, tp->dr_total_bits);
+    /* Scan the run of same-value bits to find the next transition */
+    uint32_t end_run = dr_scan_run(p, tp->sub_ofs, start_bit, tp->dr_total_bits);
+    uint32_t run = end_run - start_bit;
+    tp->dr_abs_bit = end_run;
+    /* Schedule next edge precisely (accumulate from edge_t, never from t_now) */
+    tp->next_edge_at = edge_t + (uint64_t)run * (uint64_t)tp->dr_ts_per_sample;
 
-    uint32_t run = i - tp->dr_abs_bit;
-    tp->dr_abs_bit = i;
-
-    /* Toggle de nivel al final del run */
-    TZX_EAR_SET(tp, tp->next_edge_at, cur ? 0 : 1);
-    tp->next_edge_at = t_now + (uint64_t)run * (uint64_t)tp->dr_ts_per_sample;
+    TZX_TRACEF("[TZX:DR] edge at t=%llu: level=%d bits[%u..%u) run=%u next_t=%llu\n",
+        (unsigned long long)edge_t, new_level, start_bit, end_run, run,
+        (unsigned long long)tp->next_edge_at);
 }
 
 /* -------- 0x18 CSW v2 -------- */
@@ -787,8 +805,10 @@ static void tzx_proc_csw(tzx_player_t* tp, uint64_t t_now)
     uint32_t idx = tp->i_byte;
     uint32_t cnt = csw_next_count(d, tp->sub_len, &idx, tp->csw_ctype);
     if (cnt==0){
+        /* End of CSW: anchor pause to the last scheduled edge (no drift) */
+        uint64_t end_t = tp->next_edge_at ? tp->next_edge_at : tp->slice_origin;
         if (tp->p_pause_ms){
-            tp->pause_end_at = t_now + ms_to_tstates(tp->p_pause_ms);
+            tp->pause_end_at = end_t + ms_to_tstates(tp->p_pause_ms);
             tp->next_edge_at = 0;
             tzx_next_block(tp);  /* avanzar ya al siguiente bloque */
         } else {
@@ -796,8 +816,11 @@ static void tzx_proc_csw(tzx_player_t* tp, uint64_t t_now)
         }
         return;
     }
-    TZX_EAR_TOGGLE(tp, tp->next_edge_at ? tp->next_edge_at : t_now);
-    tp->next_edge_at = t_now + (uint64_t)cnt * (uint64_t)tp->p_0;
+    {
+        uint64_t edge_t = tp->next_edge_at ? tp->next_edge_at : tp->slice_origin;
+        TZX_EAR_TOGGLE(tp, edge_t);
+        tp->next_edge_at = edge_t + (uint64_t)cnt * (uint64_t)tp->p_0;
+    }
     tp->i_byte = idx;
 }
 
