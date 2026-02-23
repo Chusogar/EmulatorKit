@@ -837,7 +837,7 @@ static void tzx_parse_generalized_tables(tzx_player_t* tp)
     /* Minimum header: 4(blen)+2(pause)+4(totp)+1(npp)+1(asp)+4(totd)+1(npd)+1(asd) = 18 */
     if (plen < 18){
         TZX_TRACEF("[TZX] 0x19 header truncated (plen=%u < 18)\n", plen);
-        tzx_set_error(tp,"0x19: payload truncated");
+        tzx_set_error(tp,"TZX 0x19 truncado");
         tp->done=1; return;
     }
 
@@ -847,7 +847,7 @@ static void tzx_parse_generalized_tables(tzx_player_t* tp)
     /* blen is the byte count AFTER the 4-byte blen field; full payload must be 4+blen */
     if (plen < 4 + blen){
         TZX_TRACEF("[TZX] 0x19 blen=%u inconsistent with plen=%u\n", blen, plen);
-        tzx_set_error(tp,"0x19: block truncated (blen mismatch)");
+        tzx_set_error(tp,"TZX 0x19 truncado");
         tp->done=1; return;
     }
     uint32_t block_end = 4 + blen; /* exclusive end of block payload */
@@ -872,44 +872,41 @@ static void tzx_parse_generalized_tables(tzx_player_t* tp)
         tp->done=1; return;
     }
 
-    /* Validate pulse counts against storage limit; fail explicitly rather than silently truncate */
-    if (tp->gen_npp > TZX_MAX_PULSES){
-        TZX_TRACEF("[TZX] 0x19 npp=%u > TZX_MAX_PULSES=%u\n", tp->gen_npp, TZX_MAX_PULSES);
-        tzx_set_error(tp,"0x19: npp exceeds TZX_MAX_PULSES");
-        tp->done=1; return;
-    }
-    if (tp->gen_npd > TZX_MAX_PULSES){
-        TZX_TRACEF("[TZX] 0x19 npd=%u > TZX_MAX_PULSES=%u\n", tp->gen_npd, TZX_MAX_PULSES);
-        tzx_set_error(tp,"0x19: npd exceeds TZX_MAX_PULSES");
-        tp->done=1; return;
-    }
+    /* Validate pulse counts against storage limit; if npp/npd exceeds TZX_MAX_PULSES
+     * we truncate: only store the first TZX_MAX_PULSES pulses per symbol and skip
+     * the remaining bytes in the file, so the file is still parsed correctly. */
 
     uint32_t q = 18;
 
     /* alphap */
     tp->gen_ofs_alphaP = 0;
     if (tp->gen_totp>0){
-        /* Each pilot symbol: 1 byte flags + npp*2 bytes pulses */
-        uint32_t sym_size = 1u + 2u * tp->gen_npp;
+        /* Each pilot symbol in the file: 1 byte flags + gen_npp*2 bytes pulses.
+         * We store at most TZX_MAX_PULSES pulses per symbol (truncate excess).
+         * TZX_MAX_PULSES (16) fits in uint8_t so the cast below is always safe. */
+        uint32_t store_npp = (tp->gen_npp > TZX_MAX_PULSES) ? TZX_MAX_PULSES : tp->gen_npp;
+        uint32_t sym_size  = 1u + 2u * (uint32_t)tp->gen_npp;
         uint64_t alpha_p_size = (uint64_t)tp->gen_asp * sym_size;
         if ((uint64_t)q + alpha_p_size > block_end){
             TZX_TRACEF("[TZX] 0x19 alphaP table OOB (q=%u size=%llu block_end=%u)\n",
                 q, (unsigned long long)alpha_p_size, block_end);
-            tzx_set_error(tp,"0x19: alphaP table out of bounds");
+            tzx_set_error(tp,"TZX 0x19 truncado");
             tp->done=1; return;
         }
         tp->gen_ofs_alphaP = q;
         for (int i=0;i<(int)tp->gen_asp;i++){
             tzx_symbol_t* s = &tp->gen_symP[i];
-            s->flags = p[q+0]; s->npulses = tp->gen_npp;
-            for (int k=0;k<tp->gen_npp;k++) s->pulses[k]=rd_le16(p+q+1+2*k);
-            q += sym_size;
+            s->flags = p[q+0];
+            /* Store only up to TZX_MAX_PULSES pulses; extra file pulses are ignored */
+            s->npulses = (uint8_t)store_npp;
+            for (int k=0;k<(int)store_npp;k++) s->pulses[k]=rd_le16(p+q+1+2*k);
+            q += sym_size; /* advance by full per-symbol file size */
         }
         /* Pilot stream: totp entries of 3 bytes each (1 sym_idx + 2 rep) */
         if ((uint64_t)q + (uint64_t)3 * tp->gen_totp > block_end){
             TZX_TRACEF("[TZX] 0x19 pilotStream OOB (q=%u totp=%u block_end=%u)\n",
                 q, tp->gen_totp, block_end);
-            tzx_set_error(tp,"0x19: pilot stream out of bounds");
+            tzx_set_error(tp,"TZX 0x19 truncado");
             tp->done=1; return;
         }
         tp->gen_ofs_pilotStream = q;
@@ -919,20 +916,25 @@ static void tzx_parse_generalized_tables(tzx_player_t* tp)
     /* alphad */
     tp->gen_ofs_alphaD = q;
     if (tp->gen_totd>0){
-        /* Each data symbol: 1 byte flags + npd*2 bytes pulses */
-        uint32_t sym_size = 1u + 2u * tp->gen_npd;
+        /* Each data symbol in the file: 1 byte flags + gen_npd*2 bytes pulses.
+         * We store at most TZX_MAX_PULSES pulses per symbol (truncate excess).
+         * TZX_MAX_PULSES (16) fits in uint8_t so the cast below is always safe. */
+        uint32_t store_npd = (tp->gen_npd > TZX_MAX_PULSES) ? TZX_MAX_PULSES : tp->gen_npd;
+        uint32_t sym_size  = 1u + 2u * (uint32_t)tp->gen_npd;
         uint64_t alpha_d_size = (uint64_t)tp->gen_asd * sym_size;
         if ((uint64_t)q + alpha_d_size > block_end){
             TZX_TRACEF("[TZX] 0x19 alphaD table OOB (q=%u size=%llu block_end=%u)\n",
                 q, (unsigned long long)alpha_d_size, block_end);
-            tzx_set_error(tp,"0x19: alphaD table out of bounds");
+            tzx_set_error(tp,"TZX 0x19 truncado");
             tp->done=1; return;
         }
         for (int i=0;i<(int)tp->gen_asd;i++){
             tzx_symbol_t* s = &tp->gen_symD[i];
-            s->flags = p[q+0]; s->npulses = tp->gen_npd;
-            for (int k=0;k<tp->gen_npd;k++) s->pulses[k]=rd_le16(p+q+1+2*k);
-            q += sym_size;
+            s->flags = p[q+0];
+            /* Store only up to TZX_MAX_PULSES pulses; extra file pulses are ignored */
+            s->npulses = (uint8_t)store_npd;
+            for (int k=0;k<(int)store_npd;k++) s->pulses[k]=rd_le16(p+q+1+2*k);
+            q += sym_size; /* advance by full per-symbol file size */
         }
         tp->gen_bits = 0; while ((1<<tp->gen_bits) < (int)tp->gen_asd) tp->gen_bits++;
         tp->gen_data_dsize = (uint32_t)(((uint64_t)tp->gen_bits * tp->gen_totd + 7) / 8);
@@ -940,7 +942,7 @@ static void tzx_parse_generalized_tables(tzx_player_t* tp)
         if ((uint64_t)q + tp->gen_data_dsize > block_end){
             TZX_TRACEF("[TZX] 0x19 dataStream OOB (q=%u dsize=%u block_end=%u)\n",
                 q, tp->gen_data_dsize, block_end);
-            tzx_set_error(tp,"0x19: data stream out of bounds");
+            tzx_set_error(tp,"TZX 0x19 truncado");
             tp->done=1; return;
         }
         tp->gen_ofs_dataStream = q;
@@ -1026,7 +1028,7 @@ static int gen_read_pilot_entry(tzx_player_t* tp, uint8_t* out_sym_idx, uint16_t
     uint32_t ofs = tp->gen_ofs_pilotStream + 3*tp->gen_pilot_pos;
     if (ofs + 3 > plen){
         TZX_TRACEF("[TZX] 0x19 pilot stream read OOB (ofs=%u plen=%u)\n", ofs, plen);
-        tzx_set_error(tp,"0x19: pilot stream read out of bounds");
+        tzx_set_error(tp,"TZX 0x19 truncado");
         tp->done=1; return 0;
     }
     uint8_t sidx = p[ofs+0];
@@ -1263,6 +1265,7 @@ static void tzx_advance_to(tzx_player_t* tp, uint64_t t_now)
             tp->i_byte = 0; tp->bit_mask = 0x80; tp->subpulse = 0;
             tp->gen_cur_sym = NULL;
             tp->gen_inited = 0;
+            tp->gen_loaded = 0;
             tp->next_edge_at = 0;  /* ensure init condition triggers for the new block */
             prev_blk = tp->i_blk;
         }
