@@ -107,6 +107,7 @@ struct tzx_player {
     /* alfabetos */
     tzx_symbol_t gen_symP[TZX_MAX_ALPHA], gen_symD[TZX_MAX_ALPHA];
     int      gen_loaded;
+    int      gen_inited;   /* set once per block; prevents re-initialization of tzx_init_gen() */
     /* estado símbolo en curso */
     const tzx_symbol_t* gen_cur_sym;
     int      gen_sym_ip;      /* índice de pulso dentro del símbolo */
@@ -188,7 +189,7 @@ void tzx_rewind(tzx_player_t* tp){
     tp->i_byte=0; tp->bit_mask=0x80; tp->subpulse=0;
     tp->dr_total_bits=0; tp->dr_abs_bit=0; tp->dr_ts_per_sample=0;
     /* 0x19 */
-    tp->gen_loaded=0; tp->gen_phase=0; tp->gen_cur_sym=NULL;
+    tp->gen_loaded=0; tp->gen_inited=0; tp->gen_phase=0; tp->gen_cur_sym=NULL;
     tp->gen_sym_ip=0; tp->gen_sym_rem=0;
     tp->gen_pilot_pos=0; tp->gen_pilot_rep_left=0;
     tp->gen_data_pos=0; tp->gen_data_dsize=0; tp->gen_data_ofs=0;
@@ -1028,25 +1029,8 @@ static void tzx_init_gen(tzx_player_t* tp)
     if (tp->done) return; /* parse failed */
     tp->next_edge_at = 0;
     tp->pause_end_at = 0;
-    /* arrancar primer símbolo si hay pilot */
-    if (tp->gen_phase==0){
-        /* leer primera entrada pilot (idx+rep) */
-        uint8_t sidx; uint16_t rep;
-        if (!gen_read_pilot_entry(tp,&sidx,&rep)){ tp->gen_phase = (tp->gen_totd?1:2); return; }
-        tp->gen_pilot_sym_idx = sidx;
-        tp->gen_pilot_rep_left = rep;
-        gen_start_symbol(tp, &tp->gen_symP[tp->gen_pilot_sym_idx], tp->slice_origin);
-    } else if (tp->gen_phase==1){
-        /* empezar data stream */
-        uint32_t sidx=0;
-        if (!gen_read_data_symbol_index(tp, &tp->gen_data_ofs, &tp->gen_data_bits_left, &tp->gen_data_byte, &sidx)){
-            tp->gen_phase = 2; return;
-        }
-        gen_start_symbol(tp, &tp->gen_symD[sidx], tp->slice_origin);
-        tp->gen_data_pos = 1;
-    } else {
-        /* pausa/done */
-    }
+    tp->gen_inited = 1;
+    /* first symbol is started on the first tzx_proc_gen() call via the restart loop */
 }
 
 static void tzx_proc_gen(tzx_player_t* tp, uint64_t t_now)
@@ -1054,74 +1038,66 @@ static void tzx_proc_gen(tzx_player_t* tp, uint64_t t_now)
     if (!tp->gen_loaded) tzx_parse_generalized_tables(tp);
     if (tp->done) return;
 
-    /* Si no hay edge programado, intentamos arrancar */
-    if (!tp->next_edge_at && tp->gen_cur_sym==NULL){
-        if (tp->gen_phase==0){
-            if (tp->gen_pilot_rep_left==0){
-                /* tomar siguiente entrada */
-                uint8_t sidx; uint16_t rep;
-                if (!gen_read_pilot_entry(tp,&sidx,&rep)){
-                    tp->gen_phase = (tp->gen_totd?1:2);
-                } else {
-                    tp->gen_pilot_sym_idx = sidx;
-                    tp->gen_pilot_rep_left = rep;
-                    gen_start_symbol(tp, &tp->gen_symP[tp->gen_pilot_sym_idx], t_now);
-                }
-            } else {
-                /* aún quedan repeticiones del mismo símbolo */
-                gen_start_symbol(tp, &tp->gen_symP[tp->gen_pilot_sym_idx], t_now);
-            }
-            return;
-        } else if (tp->gen_phase==1){
-            if (tp->gen_data_pos >= tp->gen_totd){
-                tp->gen_phase = 2;
-            } else {
-                uint32_t sidx=0;
-                if (!gen_read_data_symbol_index(tp, &tp->gen_data_ofs, &tp->gen_data_bits_left, &tp->gen_data_byte, &sidx)){
-                    tp->gen_phase = 2;
-                } else {
-                    gen_start_symbol(tp, &tp->gen_symD[sidx], t_now);
-                    tp->gen_data_pos++;
-                }
-            }
-            return;
-        } else {
-            /* pausa/done */
-            if (tp->gen_pause){
-                tp->pause_end_at = t_now + ms_to_tstates(tp->gen_pause);
-                tp->next_edge_at = 0; tp->gen_pause = 0;
-                tzx_next_block(tp);  /* avanzar ya al siguiente bloque */
-                return;
-            } else {
-                tzx_next_block(tp); return;
-            }
-        }
-    }
-
     /* Si hay un edge programado y aún no hemos llegado, esperamos */
     if (tp->next_edge_at && t_now < tp->next_edge_at) return;
 
-    /* Consumimos un pulso del símbolo actual */
+    /* Consumimos el siguiente pulso del símbolo en curso */
     if (tp->gen_cur_sym){
         int done = gen_advance_symbol(tp, t_now);
         if (!done) return; /* sigue en el mismo símbolo (siguiente pulso ya programado) */
-        /* símbolo terminado: pasamos a repetir o al siguiente */
-        if (tp->gen_phase==0){
-            if (tp->gen_pilot_rep_left>0) tp->gen_pilot_rep_left--;
-            if (tp->gen_pilot_rep_left>0){
-                /* repetir el mismo símbolo */
-                return;
-            } else {
-                /* siguiente entrada */
-                return;
+        /* Símbolo completado; actualizar contadores de repetición */
+        if (tp->gen_phase == 0){
+            if (tp->gen_pilot_rep_left > 0) tp->gen_pilot_rep_left--;
+        }
+        tp->gen_cur_sym = NULL;
+        /* fall-through al bloque de arranque a continuación */
+    }
+
+    /* Arranque del siguiente símbolo/fase.
+     * Iteramos para avanzar de inmediato por símbolos vacíos (todos sus pulsos = 0),
+     * lo que evita que el reproductor se quede bloqueado hasta la siguiente llamada.
+     * El límite de 65536 cubre el peor caso: un único entry con rep=0 (= 65536 según
+     * la especificación TZX) compuesto íntegramente de símbolos de pulso cero. */
+    int guard = 65536;
+    while (!tp->done && !tp->next_edge_at && tp->gen_cur_sym == NULL && guard-- > 0){
+        if (tp->gen_phase == 0){
+            if (tp->gen_pilot_rep_left == 0){
+                uint8_t sidx; uint16_t rep;
+                if (!gen_read_pilot_entry(tp, &sidx, &rep)){
+                    tp->gen_phase = tp->gen_totd ? 1 : 2;
+                    continue;
+                }
+                tp->gen_pilot_sym_idx = sidx;
+                tp->gen_pilot_rep_left = rep;
             }
-        } else if (tp->gen_phase==1){
-            /* siguiente símbolo de datos */
+            gen_start_symbol(tp, &tp->gen_symP[tp->gen_pilot_sym_idx], t_now);
+            /* Símbolo vacío (todos los pulsos cero): contarlo como completado de inmediato */
+            if (tp->gen_cur_sym == NULL && !tp->next_edge_at){
+                if (tp->gen_pilot_rep_left > 0) tp->gen_pilot_rep_left--;
+            }
+        } else if (tp->gen_phase == 1){
+            if (tp->gen_data_pos >= tp->gen_totd){
+                tp->gen_phase = 2; continue;
+            }
+            uint32_t sidx = 0;
+            if (!gen_read_data_symbol_index(tp, &tp->gen_data_ofs,
+                                            &tp->gen_data_bits_left,
+                                            &tp->gen_data_byte, &sidx)){
+                tp->gen_phase = 2; continue;
+            }
+            gen_start_symbol(tp, &tp->gen_symD[sidx], t_now);
+            tp->gen_data_pos++;
+        } else { /* phase 2: pausa/done */
+            if (tp->gen_pause){
+                tp->pause_end_at = t_now + ms_to_tstates(tp->gen_pause);
+                tp->next_edge_at = 0; tp->gen_pause = 0;
+                tzx_next_block(tp);
+            } else {
+                tzx_next_block(tp);
+            }
             return;
         }
     }
-
-    /* Si no hay símbolo y no hay edge, avanzamos de fase en próxima llamada */
 }
 
 /* ================ control de flujo y avance global ============ */
@@ -1241,6 +1217,7 @@ static void tzx_advance_to(tzx_player_t* tp, uint64_t t_now)
             tp->pilot_left = 0;
             tp->i_byte = 0; tp->bit_mask = 0x80; tp->subpulse = 0;
             tp->gen_cur_sym = NULL;
+            tp->gen_inited = 0;
             tp->next_edge_at = 0;  /* ensure init condition triggers for the new block */
             prev_blk = tp->i_blk;
         }
@@ -1266,8 +1243,10 @@ static void tzx_advance_to(tzx_player_t* tp, uint64_t t_now)
         uint8_t id = tp->blk[tp->i_blk].id;
 
         /* 4. Initialize new signal block (anchored to t_now for accurate timing) */
-        if (tp->sub_ofs == 0 && tp->sub_len == 0 && tp->next_edge_at == 0 &&
-            tp->pilot_left == 0 && tp->gen_cur_sym == NULL) {
+        int need_init = (tp->sub_ofs == 0 && tp->sub_len == 0 && tp->next_edge_at == 0 &&
+                         tp->pilot_left == 0 && tp->gen_cur_sym == NULL);
+        if (id == 0x19) need_init = !tp->gen_inited;
+        if (need_init) {
             tp->slice_origin = t_now;  /* anchor first-edge to current time */
 #if TZX_TRACE
             TZX_TRACEF("[TZX] #%d/%-3d 0x%02X %s  init\n",
