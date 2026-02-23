@@ -41,6 +41,9 @@ typedef enum {
 
 #define TZX_MAX_PULSES 16
 #define TZX_MAX_ALPHA  256
+/* TZX pilot stream: REP=0 is a special value meaning 65536 additional repetitions,
+ * giving 65537 total plays of the symbol (REP+1 rule with REP=0 → 65536 additional). */
+#define TZX_REP_ZERO_PLAYS 65537u
 
 typedef struct {
     uint8_t flags;                /* 0: invert; 1: same; 2: force low; 3: force high (bits 0..1) */
@@ -115,7 +118,7 @@ struct tzx_player {
     /* pilot stream */
     uint32_t gen_pilot_pos;   /* símbolo # actual dentro de totp */
     uint8_t  gen_pilot_sym_idx;
-    uint16_t gen_pilot_rep_left;
+    uint32_t gen_pilot_rep_left;
     /* data stream */
     int      gen_bits;        /* bits por símbolo (ceil log2(asd)) */
     uint32_t gen_data_pos;    /* símbolo # consumidos */
@@ -1047,7 +1050,7 @@ static void tzx_proc_gen(tzx_player_t* tp, uint64_t t_now)
         if (!done) return; /* sigue en el mismo símbolo (siguiente pulso ya programado) */
         /* Símbolo completado; actualizar contadores de repetición */
         if (tp->gen_phase == 0){
-            if (tp->gen_pilot_rep_left > 0) tp->gen_pilot_rep_left--;
+            tp->gen_pilot_rep_left--;
         }
         tp->gen_cur_sym = NULL;
         /* fall-through al bloque de arranque a continuación */
@@ -1056,9 +1059,10 @@ static void tzx_proc_gen(tzx_player_t* tp, uint64_t t_now)
     /* Arranque del siguiente símbolo/fase.
      * Iteramos para avanzar de inmediato por símbolos vacíos (todos sus pulsos = 0),
      * lo que evita que el reproductor se quede bloqueado hasta la siguiente llamada.
-     * El límite de 65536 cubre el peor caso: un único entry con rep=0 (= 65536 según
-     * la especificación TZX) compuesto íntegramente de símbolos de pulso cero. */
-    int guard = 65536;
+     * El límite TZX_MAX_EDGES_PER_SLICE acota el coste por slice de forma coherente
+     * con el resto del motor; si se alcanza, la función retorna sin avanzar de bloque
+     * y el host vuelve a llamar en el siguiente slice. */
+    int guard = TZX_MAX_EDGES_PER_SLICE;
     while (!tp->done && !tp->next_edge_at && tp->gen_cur_sym == NULL && guard-- > 0){
         if (tp->gen_phase == 0){
             if (tp->gen_pilot_rep_left == 0){
@@ -1068,12 +1072,12 @@ static void tzx_proc_gen(tzx_player_t* tp, uint64_t t_now)
                     continue;
                 }
                 tp->gen_pilot_sym_idx = sidx;
-                tp->gen_pilot_rep_left = rep;
+                tp->gen_pilot_rep_left = (rep == 0) ? TZX_REP_ZERO_PLAYS : (uint32_t)(rep + 1u);
             }
             gen_start_symbol(tp, &tp->gen_symP[tp->gen_pilot_sym_idx], t_now);
             /* Símbolo vacío (todos los pulsos cero): contarlo como completado de inmediato */
             if (tp->gen_cur_sym == NULL && !tp->next_edge_at){
-                if (tp->gen_pilot_rep_left > 0) tp->gen_pilot_rep_left--;
+                tp->gen_pilot_rep_left--;
             }
         } else if (tp->gen_phase == 1){
             if (tp->gen_data_pos >= tp->gen_totd){
