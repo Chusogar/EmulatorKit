@@ -550,8 +550,8 @@ static void tzx_proc_std_or_turbo(tzx_player_t* tp, uint64_t t_now)
         if (tp->bit_mask==0x01){ tp->bit_mask=0x80; tp->i_byte++; }
         else tp->bit_mask >>= 1;
 
-        /* última byte con used_bits (solo turbo/pure) */
-        if ((tp->blk[tp->i_blk].id==0x11) &&
+        /* último byte con used_bits (turbo 0x11 y pure data 0x14) */
+        if ((tp->blk[tp->i_blk].id==0x11 || tp->blk[tp->i_blk].id==0x14) &&
             tp->i_byte == tp->sub_len-1 && tp->p_used_bits>=1 && tp->p_used_bits<=8){
             /* si máscara cae fuera de bits usados, terminamos */
             if (tp->bit_mask < (1u<<(8 - tp->p_used_bits))){
@@ -591,7 +591,8 @@ static void tzx_init_pure_tone(tzx_player_t* tp)
     tp->p_pilot_len = rd_le16(p+0);
     tp->p_pilot_count = rd_le16(p+2);
     tp->pilot_left = (int)tp->p_pilot_count;
-    TZX_EAR_TOGGLE(tp, tp->slice_origin);
+    TZX_TRACEF("[TZX] 0x12 pure_tone init: len=%u count=%u (no initial toggle)\n",
+        tp->p_pilot_len, tp->p_pilot_count);
     tp->next_edge_at = tp->slice_origin + tp->p_pilot_len;
 }
 static void tzx_proc_pure_tone(tzx_player_t* tp, uint64_t t_now)
@@ -612,7 +613,7 @@ static void tzx_init_pulse_seq(tzx_player_t* tp)
     if (1 + 2*np > plen){ tp->done=1; return; }
     tp->sub_ofs = 1; tp->sub_len = 1 + 2*np;
     tp->i_byte = 0;
-    TZX_EAR_TOGGLE(tp, tp->slice_origin);
+    TZX_TRACEF("[TZX] 0x13 pulse_seq init: np=%u (no initial toggle)\n", np);
     uint16_t t = rd_le16(p+tp->sub_ofs);
     tp->next_edge_at = tp->slice_origin + t;
 }
@@ -642,7 +643,8 @@ static void tzx_init_pure_data(tzx_player_t* tp)
     tp->sub_ofs = 10; tp->sub_len = tp->data_len;
     tp->i_byte=0; tp->bit_mask=0x80; tp->subpulse=0;
 
-    TZX_EAR_TOGGLE(tp, tp->slice_origin);
+    TZX_TRACEF("[TZX] 0x14 pure_data init: p0=%u p1=%u usedbits=%u pause=%ums len=%u (no initial toggle)\n",
+        tp->p_0, tp->p_1, tp->p_used_bits, tp->p_pause_ms, tp->data_len);
     uint8_t b = p[tp->sub_ofs];
     int bit = (b & tp->bit_mask)?1:0;
     tp->next_edge_at = tp->slice_origin + (bit?tp->p_1:tp->p_0);
@@ -1144,6 +1146,7 @@ static void tzx_advance_to(tzx_player_t* tp, uint64_t t_now)
             tp->pilot_left = 0;
             tp->i_byte = 0; tp->bit_mask = 0x80; tp->subpulse = 0;
             tp->gen_cur_sym = NULL;
+            tp->next_edge_at = 0;  /* ensure init condition triggers for the new block */
             prev_blk = tp->i_blk;
         }
 
