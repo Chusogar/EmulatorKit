@@ -161,7 +161,7 @@ static int audio_init_sdl(int rate)
         return -1;
     }
     audio_rate = have.freq;
-    SDL_PauseAudioDevice(audio_dev, 0);
+    SDL_PauseAudioDevice(audio_dev, 1);
     return 0;
 }
 
