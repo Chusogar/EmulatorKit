@@ -1071,6 +1071,12 @@ static void tzx_init_gen(tzx_player_t* tp)
     tp->next_edge_at = 0;
     tp->pause_end_at = 0;
     tp->gen_last_edge_t = 0;  /* reset per-block edge-time anchor */
+    /* Reinitialise data stream reader at block start so that any stale state
+     * from a previous 0x19 block does not corrupt symbol index decoding. */
+    tp->gen_data_pos       = 0;
+    tp->gen_data_ofs       = tp->gen_ofs_dataStream;
+    tp->gen_data_bits_left = 0;
+    tp->gen_data_byte      = 0;
     tp->gen_inited = 1;
     /* first symbol is started on the first tzx_proc_gen() call via the restart loop */
 }
@@ -1106,7 +1112,17 @@ static void tzx_proc_gen(tzx_player_t* tp, uint64_t t_now)
             if (tp->gen_pilot_rep_left == 0){
                 uint8_t sidx; uint16_t rep;
                 if (!gen_read_pilot_entry(tp, &sidx, &rep)){
-                    tp->gen_phase = tp->gen_totd ? 1 : 2;
+                    if (tp->gen_totd){
+                        /* Reset data stream reader to avoid bit/byte desynchronisation
+                         * when entering DATA phase (e.g. consecutive Speedlock 3 blocks). */
+                        tp->gen_phase          = 1;
+                        tp->gen_data_pos       = 0;
+                        tp->gen_data_ofs       = tp->gen_ofs_dataStream;
+                        tp->gen_data_bits_left = 0;
+                        tp->gen_data_byte      = 0;
+                    } else {
+                        tp->gen_phase = 2;
+                    }
                     continue;
                 }
                 tp->gen_pilot_sym_idx = sidx;
