@@ -880,15 +880,15 @@ static void tzx_parse_generalized_tables(tzx_player_t* tp)
             for (int k=0;k<tp->gen_npp;k++) s->pulses[k]=rd_le16(p+q+1+2*k);
             q += sym_size;
         }
-        /* Pilot stream: totp entries of 3 bytes each (1 sym_idx + 2 rep) */
-        if ((uint64_t)q + (uint64_t)3 * tp->gen_totp > block_end){
+        /* Pilot stream: totp entries of 1 byte each (sym_idx only; no per-entry rep) */
+        if ((uint64_t)q + (uint64_t)tp->gen_totp > block_end){
             TZX_TRACEF("[TZX] 0x19 pilotStream OOB (q=%u totp=%u block_end=%u)\n",
                 q, tp->gen_totp, block_end);
             tzx_set_error(tp,"0x19: pilot stream out of bounds");
             tp->done=1; return;
         }
         tp->gen_ofs_pilotStream = q;
-        q += 3u * tp->gen_totp;
+        q += tp->gen_totp;
     }
 
     /* alphad */
@@ -985,20 +985,20 @@ static int gen_read_pilot_entry(tzx_player_t* tp, uint8_t* out_sym_idx, uint16_t
 {
     uint32_t plen; const uint8_t* p = cur_payload(tp,&plen);
     if (tp->gen_pilot_pos >= tp->gen_totp) return 0;
-    uint32_t ofs = tp->gen_ofs_pilotStream + 3*tp->gen_pilot_pos;
-    if (ofs + 3 > plen){
+    uint32_t ofs = tp->gen_ofs_pilotStream + tp->gen_pilot_pos; /* 1 byte per entry */
+    if (ofs + 1 > plen){
         TZX_TRACEF("[TZX] 0x19 pilot stream read OOB (ofs=%u plen=%u)\n", ofs, plen);
         tzx_set_error(tp,"0x19: pilot stream read out of bounds");
         tp->done=1; return 0;
     }
-    uint8_t sidx = p[ofs+0];
+    uint8_t sidx = p[ofs];
     if (sidx >= tp->gen_asp){
         TZX_TRACEF("[TZX] 0x19 pilot symidx=%u >= asp=%u\n", sidx, tp->gen_asp);
         tzx_set_error(tp,"0x19: pilot symbol index out of range");
         tp->done=1; return 0;
     }
     *out_sym_idx = sidx;
-    *out_rep     = rd_le16(p+ofs+1);
+    *out_rep     = 1; /* direct sequence: each entry plays exactly once */
     tp->gen_pilot_pos++;
     return 1;
 }
@@ -1014,8 +1014,8 @@ static int gen_read_data_symbol_index(tzx_player_t* tp, uint32_t* io_ofs, int* i
             *io_byte = p[*io_ofs]; (*io_ofs)++;
             *io_bits_left = 8;
         }
-        idx = (idx<<1) | ((*io_byte & 0x80)?1:0); /* MSB-first */
-        *io_byte <<=1; (*io_bits_left)--;
+        idx |= (uint32_t)((*io_byte & 1) << b);   /* LSB-first */
+        *io_byte >>= 1; (*io_bits_left)--;
     }
     if (tp->gen_asd > 0 && idx >= (uint32_t)tp->gen_asd){
         TZX_TRACEF("[TZX] 0x19 data symidx=%u >= asd=%u\n", idx, tp->gen_asd);
@@ -1072,7 +1072,7 @@ static void tzx_proc_gen(tzx_player_t* tp, uint64_t t_now)
                     continue;
                 }
                 tp->gen_pilot_sym_idx = sidx;
-                tp->gen_pilot_rep_left = (rep == 0) ? TZX_REP_ZERO_PLAYS : (uint32_t)(rep + 1u);
+                tp->gen_pilot_rep_left = rep; /* direct count: 1 play per pilot stream entry */
             }
             gen_start_symbol(tp, &tp->gen_symP[tp->gen_pilot_sym_idx], t_now);
             /* Símbolo vacío (todos los pulsos cero): contarlo como completado de inmediato */
