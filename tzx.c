@@ -957,74 +957,94 @@ static void tzx_proc_gen(tzx_player_t* tp, uint64_t t_now)
 {
     if (!tp->gen_loaded) tzx_parse_generalized_tables(tp);
 
-    /* Si no hay edge programado, intentamos arrancar */
-    if (!tp->next_edge_at && tp->gen_cur_sym==NULL){
-        if (tp->gen_phase==0){
-            if (tp->gen_pilot_rep_left==0){
-                /* tomar siguiente entrada */
+    /* If there's a scheduled edge in the future, wait */
+    if (tp->next_edge_at && t_now < tp->next_edge_at) return;
+
+    /* If currently playing a symbol, advance to the next pulse */
+    if (tp->gen_cur_sym) {
+        int done = gen_advance_symbol(tp, t_now);
+        if (!done) return;  /* still in the same symbol, next edge scheduled */
+        /* Symbol complete; decrement the pilot repetition counter */
+        if (tp->gen_phase == 0 && tp->gen_pilot_rep_left > 0)
+            tp->gen_pilot_rep_left--;
+        /* Fall through to schedule the next symbol below */
+    }
+
+    /* Advance state until the next non-zero edge is scheduled or the block ends.
+     * Handles phase transitions and zero-duration (empty) symbols in-place so
+     * that the stall guard in tzx_advance_to() is never triggered for valid data.
+     * 512 iterations is ample for any real-world 0x19 block: phase transitions
+     * consume at most 3 iterations; each symbol or rep-0 skip costs 1 iteration,
+     * and consecutive all-zero symbols are rare outside pathological test data. */
+    int safety = 512;
+    while (safety-- > 0) {
+        if (tp->gen_phase == 0) {
+            /* Pilot stream */
+            if (tp->gen_pilot_rep_left > 0) {
+                /* Replay current pilot symbol */
+                gen_start_symbol(tp, &tp->gen_symP[tp->gen_pilot_sym_idx], t_now);
+                if (tp->next_edge_at) return;
+                /* Zero-duration symbol: count it as played and loop */
+                tp->gen_pilot_rep_left--;
+            } else {
+                /* Fetch the next pilot PRLE entry */
                 uint8_t sidx; uint16_t rep;
-                if (!gen_read_pilot_entry(tp,&sidx,&rep)){
-                    tp->gen_phase = (tp->gen_totd?1:2);
+                if (!gen_read_pilot_entry(tp, &sidx, &rep)) {
+                    /* Pilot stream exhausted; move to data phase or completion */
+                    TZX_TRACEF("[TZX] gen pilot done -> phase %d\n",
+                               tp->gen_totd ? 1 : 2);
+                    tp->gen_phase = (tp->gen_totd ? 1 : 2);
+                    /* Continue loop to handle the new phase immediately */
                 } else {
                     tp->gen_pilot_sym_idx = sidx;
                     tp->gen_pilot_rep_left = rep;
-                    gen_start_symbol(tp, &tp->gen_symP[tp->gen_pilot_sym_idx], t_now);
+                    /* rep==0: nothing to play; next iteration reads the next entry */
+                    if (rep > 0) {
+                        gen_start_symbol(tp, &tp->gen_symP[tp->gen_pilot_sym_idx], t_now);
+                        if (tp->next_edge_at) return;
+                        /* Zero-duration symbol */
+                        tp->gen_pilot_rep_left--;
+                    }
                 }
-            } else {
-                /* aún quedan repeticiones del mismo símbolo */
-                gen_start_symbol(tp, &tp->gen_symP[tp->gen_pilot_sym_idx], t_now);
             }
-            return;
-        } else if (tp->gen_phase==1){
-            if (tp->gen_data_pos >= tp->gen_totd){
+        } else if (tp->gen_phase == 1) {
+            /* Data stream */
+            if (tp->gen_data_pos >= tp->gen_totd) {
+                TZX_TRACEF("[TZX] gen data done -> phase 2\n");
                 tp->gen_phase = 2;
+                /* Continue loop to handle phase 2 immediately */
             } else {
-                uint32_t sidx=0;
-                if (!gen_read_data_symbol_index(tp, &tp->gen_data_ofs, &tp->gen_data_bits_left, &tp->gen_data_byte, &sidx)){
+                uint32_t sidx = 0;
+                if (!gen_read_data_symbol_index(tp, &tp->gen_data_ofs,
+                        &tp->gen_data_bits_left, &tp->gen_data_byte, &sidx)) {
                     tp->gen_phase = 2;
                 } else {
-                    gen_start_symbol(tp, &tp->gen_symD[sidx], t_now);
+                    if (sidx >= (uint32_t)tp->gen_asd) {
+                        TZX_TRACEF("[TZX] gen invalid data symbol index %u (asd=%u)\n",
+                                   sidx, tp->gen_asd);
+                        tp->done = 1; return;
+                    }
                     tp->gen_data_pos++;
+                    gen_start_symbol(tp, &tp->gen_symD[sidx], t_now);
+                    if (tp->next_edge_at) return;
+                    /* Zero-duration symbol; continue */
                 }
             }
-            return;
         } else {
-            /* pausa/done */
-            if (tp->gen_pause){
+            /* Phase 2: apply pause (if any) then advance to next block */
+            TZX_TRACEF("[TZX] gen block complete pause=%u ms\n", tp->gen_pause);
+            if (tp->gen_pause) {
                 tp->pause_end_at = t_now + ms_to_tstates(tp->gen_pause);
-                tp->next_edge_at = 0; tp->gen_pause = 0;
-                tzx_next_block(tp);  /* avanzar ya al siguiente bloque */
-                return;
-            } else {
-                tzx_next_block(tp); return;
+                tp->next_edge_at = 0;
+                tp->gen_pause = 0;
             }
-        }
-    }
-
-    /* Si hay un edge programado y aún no hemos llegado, esperamos */
-    if (tp->next_edge_at && t_now < tp->next_edge_at) return;
-
-    /* Consumimos un pulso del símbolo actual */
-    if (tp->gen_cur_sym){
-        int done = gen_advance_symbol(tp, t_now);
-        if (!done) return; /* sigue en el mismo símbolo (siguiente pulso ya programado) */
-        /* símbolo terminado: pasamos a repetir o al siguiente */
-        if (tp->gen_phase==0){
-            if (tp->gen_pilot_rep_left>0) tp->gen_pilot_rep_left--;
-            if (tp->gen_pilot_rep_left>0){
-                /* repetir el mismo símbolo */
-                return;
-            } else {
-                /* siguiente entrada */
-                return;
-            }
-        } else if (tp->gen_phase==1){
-            /* siguiente símbolo de datos */
+            tzx_next_block(tp);
             return;
         }
     }
-
-    /* Si no hay símbolo y no hay edge, avanzamos de fase en próxima llamada */
+    /* Safety fallback: pathological all-zero data; avoid infinite loop */
+    TZX_TRACEF("[TZX] gen safety fallback, marking done\n");
+    tp->done = 1;
 }
 
 /* ================ control de flujo y avance global ============ */
