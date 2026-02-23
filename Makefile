@@ -328,7 +328,7 @@ sorceror: sorceror.o event_sdl2.o keymatrix.o wd17xx.o drivewire.o ppide.o ide.o
 	cc -g3 sorceror.o event_sdl2.o keymatrix.o wd17xx.o drivewire.o ppide.o ide.o z80dis.o libz80/libz80.o -lm -o sorceror -lSDL2
 
 spectrum: spectrum.o tape.o sna.o tzx.o event_sdl2.o keymatrix.o ide.o z80dis.o lib765/lib/lib765.a libz80/libz80.o
-	cc -g3 spectrum.o tape.o sna.o tzx.o event_sdl2.o keymatrix.o ide.o z80dis.o lib765/lib/lib765.a libz80/libz80.o -lm -o spectrum -lSDL2
+	cc -g3 spectrum.o tape.o sna.o tzx.o event_sdl2.o keymatrix.o ide.o z80dis.o lib765/lib/lib765.a libz80/libz80.o -lm -o spectrum -lSDL2 -lz
 
 z80all: z80all.o 16x50.o ttycon.o ide.o z80dis.o libz80/libz80.o
 	cc -g3 z80all.o 16x50.o ttycon.o ide.o z80dis.o libz80/libz80.o -lSDL2 -o z80all

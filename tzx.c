@@ -5,6 +5,7 @@
 #include <stdlib.h>
 #include <string.h>
 #include <assert.h>
+#include <zlib.h>   /* DEFLATE decompression for CSW Z-RLE (block 0x18 ctype==2) */
 
 /* Frecuencia de la CPU (t-states/seg). En 128K ~3.5469MHz; 48K ~3.5MHz.
    Las rutinas de carga de cinta son por flancos, la pequeña diferencia es tolerada. */
@@ -92,7 +93,9 @@ struct tzx_player {
     uint16_t dr_ts_per_sample;
 
     /* 0x18 CSW */
-    uint8_t  csw_ctype; /* 1 RLE; 2 Zero-RLE */
+    uint8_t  csw_ctype; /* 1 RLE; 2 Z-RLE DEFLATE (decompressed into csw_zbuf) */
+    uint8_t* csw_zbuf;     /* decompressed Z-RLE pulse buffer (NULL if not used) */
+    size_t   csw_zbuf_len; /* byte size of csw_zbuf */
 
     /* 0x19 Generalized data */
     /* parámetros */
@@ -165,6 +168,7 @@ tzx_player_t* tzx_create(void){
 }
 void tzx_destroy(tzx_player_t* tp){
     if (!tp) return;
+    free(tp->csw_zbuf);
     free(tp->blk);
     free(tp->buf);
     free(tp);
@@ -179,6 +183,7 @@ void tzx_play(tzx_player_t* tp){ if (tp){ tp->playing=1; } }
 void tzx_pause(tzx_player_t* tp, int pause_on){ if(tp){ tp->playing = pause_on?0:1; } }
 void tzx_rewind(tzx_player_t* tp){
     if (!tp) return;
+    free(tp->csw_zbuf); tp->csw_zbuf = NULL; tp->csw_zbuf_len = 0;
     tp->i_blk=0; tp->done=0;
     tp->sub_ofs=tp->sub_len=0;
     tp->frame_origin=tp->slice_origin=0;
@@ -355,8 +360,9 @@ static void tzx_trace_block_details(const tzx_player_t* tp, int idx)
         break;
     case 0x18:
         if (plen >= 14)
-            TZX_TRACEF("    blen=%u pause=%ums rate=%u ctype=%u npulses=%u\n",
-                rd_le32(p), rd_le16(p+4), rd_le24(p+6), p[9], rd_le32(p+10));
+            TZX_TRACEF("    blen=%u pause=%ums rate=%u ctype=%u(%s) npulses=%u\n",
+                rd_le32(p), rd_le16(p+4), rd_le24(p+6), p[9],
+                p[9]==1?"RLE":p[9]==2?"Z-RLE":"?", rd_le32(p+10));
         break;
     case 0x19:
         if (plen >= 18)
@@ -742,46 +748,102 @@ static void tzx_proc_direct(tzx_player_t* tp, uint64_t t_now)
 static uint32_t csw_next_count(const uint8_t* d, uint32_t len, uint32_t* idx, uint8_t ctype)
 {
     if (*idx >= len) return 0;
-    if (ctype==1){ /* RLE: 0 => ext 16-bit LE */
+    if (ctype==1){ /* RLE: 0 => ext 32-bit LE (per TZX/CSW spec) */
         uint8_t b = d[*idx]; (*idx)++;
         if (b!=0) return b;
-        if (*idx+2 > len) return 0;
-        uint16_t ext = rd_le16(&d[*idx]); (*idx)+=2;
+        if (*idx+4 > len) return 0;
+        uint32_t ext = rd_le32(&d[*idx]); (*idx)+=4;
         return ext;
-    } else if (ctype==2){ /* Zero-based RLE */
-        uint8_t b = d[*idx]; (*idx)++;
-        return (uint32_t)b + 1u;
     }
     return 0;
 }
 static void tzx_init_csw(tzx_player_t* tp)
 {
+    /* Free any previous Z-RLE decompressed buffer */
+    free(tp->csw_zbuf); tp->csw_zbuf = NULL; tp->csw_zbuf_len = 0;
+
     uint32_t plen; const uint8_t* p = cur_payload(tp,&plen);
     if (plen < 4+2+3+1+4){ tp->done=1; return; }
     uint32_t blen = rd_le32(p+0);
     uint16_t pause = rd_le16(p+4);
     uint32_t rate  = rd_le24(p+6);
     uint8_t  ctype = p[9];
-    /* uint32_t npulses = rd_le32(p+10); (informativo) */
+    uint32_t npulses = rd_le32(p+10);
 
-    if (14 + blen > plen){ tp->done=1; return; }
+    if (blen < 10 || 14 + blen > plen){ tp->done=1; return; }
+    uint32_t csw_data_len = blen - 10; /* compressed/raw CSW data after 10-byte sub-header */
+
+    if (rate == 0){ tzx_set_error(tp, "CSW: tasa de muestreo cero"); tp->done=1; return; }
     tp->p_pause_ms = pause;
     double tsps = TZX_CPU_TSTATES / (double)rate;
     tp->p_0 = (uint16_t)(tsps + 0.5); /* guardamos en p_0 */
-    tp->sub_ofs = 14; tp->sub_len = blen;
-    tp->i_byte = 0; tp->csw_ctype = ctype;
+    tp->sub_ofs = 14; tp->sub_len = csw_data_len;
+    tp->i_byte = 0; tp->csw_ctype = 1; /* after decompression always standard RLE */
 
     /* Programación diferida (se hará en proc) */
     tp->next_edge_at = 0;
+
+    if (ctype == 1) {
+        /* RLE nativo: no se requiere preprocesado */
+    } else if (ctype == 2) { /* Z-RLE: DEFLATE (zlib, RFC 1950) */
+        TZX_TRACEF("    CSW Z-RLE: descomprimiendo %u bytes (npulses=%u)\n",
+            csw_data_len, npulses);
+        if (csw_data_len == 0) {
+            tzx_set_error(tp, "CSW Z-RLE: datos vacios"); tp->done=1; return;
+        }
+        /* Allocate decompression buffer; start with npulses bytes (typically 1 byte/pulse)
+         * and double on Z_BUF_ERROR until decompression succeeds or an error occurs.
+         * Caps prevent excessive allocation for corrupt or adversarial inputs. */
+#define CSW_ZBUF_MAX (64U * 1024U * 1024U)  /* 64 MB hard ceiling */
+        size_t zbuf_alloc = (size_t)npulses;
+        if (zbuf_alloc > CSW_ZBUF_MAX) zbuf_alloc = CSW_ZBUF_MAX;
+        if (zbuf_alloc < 1024) zbuf_alloc = 1024;
+        uint8_t* zbuf = NULL;
+        for (;;) {
+            uint8_t* t = (uint8_t*)realloc(zbuf, zbuf_alloc);
+            if (!t) {
+                free(zbuf);
+                tzx_set_error(tp, "CSW Z-RLE: sin memoria"); tp->done=1; return;
+            }
+            zbuf = t;
+            uLongf out_len = (uLongf)zbuf_alloc;
+            int r = uncompress(zbuf, &out_len, p + 14, (uLong)csw_data_len);
+            if (r == Z_OK) {
+                tp->csw_zbuf = zbuf;
+                tp->csw_zbuf_len = (size_t)out_len;
+                TZX_TRACEF("    CSW Z-RLE: %u bytes descomprimidos\n", (unsigned)out_len);
+                return;
+            }
+            if (r == Z_BUF_ERROR && zbuf_alloc < CSW_ZBUF_MAX) {
+                zbuf_alloc *= 2;
+                if (zbuf_alloc > CSW_ZBUF_MAX) zbuf_alloc = CSW_ZBUF_MAX;
+                continue;
+            }
+            free(zbuf);
+            tzx_set_error(tp, "CSW Z-RLE: fallo descompresion"); tp->done=1; return;
+        }
+#undef CSW_ZBUF_MAX
+    } else {
+        tzx_set_error(tp, "CSW: tipo de compresion no soportado"); tp->done=1;
+    }
 }
 static void tzx_proc_csw(tzx_player_t* tp, uint64_t t_now)
 {
     if (tp->next_edge_at && t_now < tp->next_edge_at) return;
 
-    uint32_t plen; const uint8_t* p = cur_payload(tp,&plen);
-    const uint8_t* d = &p[tp->sub_ofs];
+    const uint8_t* d;
+    uint32_t dlen;
+    if (tp->csw_zbuf) {
+        /* Z-RLE: use the decompressed buffer */
+        d = tp->csw_zbuf;
+        dlen = (uint32_t)tp->csw_zbuf_len;
+    } else {
+        uint32_t plen; const uint8_t* p = cur_payload(tp,&plen);
+        d = &p[tp->sub_ofs];
+        dlen = tp->sub_len;
+    }
     uint32_t idx = tp->i_byte;
-    uint32_t cnt = csw_next_count(d, tp->sub_len, &idx, tp->csw_ctype);
+    uint32_t cnt = csw_next_count(d, dlen, &idx, tp->csw_ctype);
     if (cnt==0){
         if (tp->p_pause_ms){
             tp->pause_end_at = t_now + ms_to_tstates(tp->p_pause_ms);
