@@ -550,8 +550,8 @@ static void tzx_proc_std_or_turbo(tzx_player_t* tp, uint64_t t_now)
         if (tp->bit_mask==0x01){ tp->bit_mask=0x80; tp->i_byte++; }
         else tp->bit_mask >>= 1;
 
-        /* última byte con used_bits (solo turbo/pure) */
-        if ((tp->blk[tp->i_blk].id==0x11) &&
+        /* último byte con used_bits (turbo 0x11 y pure data 0x14) */
+        if ((tp->blk[tp->i_blk].id==0x11 || tp->blk[tp->i_blk].id==0x14) &&
             tp->i_byte == tp->sub_len-1 && tp->p_used_bits>=1 && tp->p_used_bits<=8){
             /* si máscara cae fuera de bits usados, terminamos */
             if (tp->bit_mask < (1u<<(8 - tp->p_used_bits))){
@@ -739,20 +739,15 @@ static void tzx_proc_direct(tzx_player_t* tp, uint64_t t_now)
 }
 
 /* -------- 0x18 CSW v2 -------- */
-static uint32_t csw_next_count(const uint8_t* d, uint32_t len, uint32_t* idx, uint8_t ctype)
+static uint32_t csw_next_count(const uint8_t* d, uint32_t len, uint32_t* idx)
 {
+    /* CSW type-1 RLE: byte count; 0 means 32-bit LE extended count follows */
     if (*idx >= len) return 0;
-    if (ctype==1){ /* RLE: 0 => ext 16-bit LE */
-        uint8_t b = d[*idx]; (*idx)++;
-        if (b!=0) return b;
-        if (*idx+2 > len) return 0;
-        uint16_t ext = rd_le16(&d[*idx]); (*idx)+=2;
-        return ext;
-    } else if (ctype==2){ /* Zero-based RLE */
-        uint8_t b = d[*idx]; (*idx)++;
-        return (uint32_t)b + 1u;
-    }
-    return 0;
+    uint8_t b = d[*idx]; (*idx)++;
+    if (b != 0) return b;
+    if (*idx + 4 > len) return 0;
+    uint32_t ext = rd_le32(&d[*idx]); (*idx) += 4;
+    return ext;
 }
 static void tzx_init_csw(tzx_player_t* tp)
 {
@@ -764,6 +759,13 @@ static void tzx_init_csw(tzx_player_t* tp)
     uint8_t  ctype = p[9];
     /* uint32_t npulses = rd_le32(p+10); (informativo) */
 
+    if (ctype == 2){
+        /* Z-RLE requires zlib decompression; not supported - skip block */
+        tzx_set_error(tp, "CSW Z-RLE (0x18 ctype=2) not supported");
+        TZX_TRACEF("[TZX] 0x18 CSW Z-RLE unsupported, skipping block\n");
+        tzx_next_block(tp);
+        return;
+    }
     if (14 + blen > plen){ tp->done=1; return; }
     tp->p_pause_ms = pause;
     double tsps = TZX_CPU_TSTATES / (double)rate;
@@ -781,7 +783,7 @@ static void tzx_proc_csw(tzx_player_t* tp, uint64_t t_now)
     uint32_t plen; const uint8_t* p = cur_payload(tp,&plen);
     const uint8_t* d = &p[tp->sub_ofs];
     uint32_t idx = tp->i_byte;
-    uint32_t cnt = csw_next_count(d, tp->sub_len, &idx, tp->csw_ctype);
+    uint32_t cnt = csw_next_count(d, tp->sub_len, &idx);
     if (cnt==0){
         if (tp->p_pause_ms){
             tp->pause_end_at = t_now + ms_to_tstates(tp->p_pause_ms);
@@ -1186,8 +1188,8 @@ static void tzx_advance_to(tzx_player_t* tp, uint64_t t_now)
             case 0x19: tzx_init_gen(tp); break;
             default:   tzx_next_block(tp); continue;
             }
-            /* If init triggered a pause (e.g. no-data direct), restart loop */
-            if (tp->pause_end_at) continue;
+            /* If init skipped block or set pause, restart loop */
+            if (tp->i_blk != prev_blk || tp->pause_end_at) continue;
         }
 
         /* 5. If next event is in the future, done for now */
