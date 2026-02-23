@@ -123,6 +123,11 @@ struct tzx_player {
     uint32_t gen_data_ofs;    /* offset de lectura en dataStream */
     uint8_t  gen_data_byte;
     int      gen_data_bits_left;
+    /* timing: precise t-state at which the most recent edge was scheduled.
+     * Used so that consecutive symbols chain without drift (each new symbol
+     * starts exactly where the previous one ended, regardless of when
+     * tzx_advance_to() is called). Reset to 0 at block start. */
+    uint64_t gen_last_edge_t;
 
     /* error */
     char     last_error[128];
@@ -193,7 +198,7 @@ void tzx_rewind(tzx_player_t* tp){
     tp->gen_sym_ip=0; tp->gen_sym_rem=0;
     tp->gen_pilot_pos=0; tp->gen_pilot_rep_left=0;
     tp->gen_data_pos=0; tp->gen_data_dsize=0; tp->gen_data_ofs=0;
-    tp->gen_data_bits_left=0; tp->gen_bits=0;
+    tp->gen_data_bits_left=0; tp->gen_bits=0; tp->gen_last_edge_t=0;
 }
 
 /* ================ indexado de bloques ======================= */
@@ -959,13 +964,21 @@ static void tzx_parse_generalized_tables(tzx_player_t* tp)
 
 static void gen_start_symbol(tzx_player_t* tp, const tzx_symbol_t* s, uint64_t t_now)
 {
+    /* Anchor new symbol to the time the previous symbol ended (gen_last_edge_t).
+     * For the very first symbol in a block gen_last_edge_t is 0, so fall back
+     * to t_now (= slice_origin, set by tzx_advance_to on block init). This
+     * ensures consecutive symbols chain without drift regardless of when
+     * tzx_advance_to() is called. */
+    uint64_t base_t = tp->gen_last_edge_t ? tp->gen_last_edge_t : t_now;
+
     /* aplicar flags de nivel */
     switch (s->flags & 3){
-        case 0: TZX_EAR_TOGGLE(tp, t_now); break;
+        case 0: TZX_EAR_TOGGLE(tp, base_t); break;
         case 1: /* igual */ break;
-        case 2: TZX_EAR_SET(tp, t_now, 0); break;
-        case 3: TZX_EAR_SET(tp, t_now, 1); break;
+        case 2: TZX_EAR_SET(tp, base_t, 0); break;
+        case 3: TZX_EAR_SET(tp, base_t, 1); break;
     }
+    tp->gen_last_edge_t = base_t;  /* track start of this symbol for empty-symbol chains */
     tp->gen_cur_sym = s;
     tp->gen_sym_ip  = 0;
     tp->gen_sym_rem = s->npulses;
@@ -975,7 +988,7 @@ static void gen_start_symbol(tzx_player_t* tp, const tzx_symbol_t* s, uint64_t t
         uint16_t dur = s->pulses[tp->gen_sym_ip++];
         tp->gen_sym_rem--;
         if (dur){
-            tp->next_edge_at = t_now + dur;
+            tp->next_edge_at = base_t + dur;
             return;
         }
     }
@@ -983,16 +996,21 @@ static void gen_start_symbol(tzx_player_t* tp, const tzx_symbol_t* s, uint64_t t
     tp->next_edge_at = 0;
 }
 
-static int gen_advance_symbol(tzx_player_t* tp, uint64_t t_now)
+static int gen_advance_symbol(tzx_player_t* tp)
 {
-    /* llamado cuando hemos alcanzado next_edge_at: hacemos toggle y buscamos siguiente pulso */
+    /* Called when t_now >= next_edge_at: fire the scheduled edge and schedule
+     * the next pulse within the same symbol.
+     * All scheduling is anchored to the saved edge_t (not the caller's t_now)
+     * to avoid cumulative timing drift within a multi-pulse symbol. */
     if (!tp->gen_cur_sym) return 1; /* terminado */
-    TZX_EAR_TOGGLE(tp, tp->next_edge_at);
+    uint64_t edge_t = tp->next_edge_at;   /* exact time this edge fires */
+    TZX_EAR_TOGGLE(tp, edge_t);
+    tp->gen_last_edge_t = edge_t;         /* remember for next symbol's start */
     while (tp->gen_sym_rem > 0){
         uint16_t dur = tp->gen_cur_sym->pulses[tp->gen_sym_ip++];
         tp->gen_sym_rem--;
         if (dur){
-            tp->next_edge_at = t_now + dur;
+            tp->next_edge_at = edge_t + dur; /* drift-free: relative to edge_t */
             return 0; /* sigue dentro del símbolo */
         }
     }
@@ -1052,6 +1070,7 @@ static void tzx_init_gen(tzx_player_t* tp)
     if (tp->done) return; /* parse failed */
     tp->next_edge_at = 0;
     tp->pause_end_at = 0;
+    tp->gen_last_edge_t = 0;  /* reset per-block edge-time anchor */
     tp->gen_inited = 1;
     /* first symbol is started on the first tzx_proc_gen() call via the restart loop */
 }
@@ -1066,7 +1085,7 @@ static void tzx_proc_gen(tzx_player_t* tp, uint64_t t_now)
 
     /* Consumimos el siguiente pulso del símbolo en curso */
     if (tp->gen_cur_sym){
-        int done = gen_advance_symbol(tp, t_now);
+        int done = gen_advance_symbol(tp);
         if (!done) return; /* sigue en el mismo símbolo (siguiente pulso ya programado) */
         /* Símbolo completado; actualizar contadores de repetición */
         if (tp->gen_phase == 0){
@@ -1112,7 +1131,10 @@ static void tzx_proc_gen(tzx_player_t* tp, uint64_t t_now)
             tp->gen_data_pos++;
         } else { /* phase 2: pausa/done */
             if (tp->gen_pause){
-                tp->pause_end_at = t_now + ms_to_tstates(tp->gen_pause);
+                /* Anchor pause to the last scheduled edge to prevent drift;
+                 * gen_last_edge_t is the time of the final edge of the block. */
+                uint64_t anchor = tp->gen_last_edge_t ? tp->gen_last_edge_t : t_now;
+                tp->pause_end_at = anchor + ms_to_tstates(tp->gen_pause);
                 tp->next_edge_at = 0; tp->gen_pause = 0;
                 tzx_next_block(tp);
             } else {
@@ -1310,7 +1332,14 @@ static void tzx_advance_to(tzx_player_t* tp, uint64_t t_now)
         default:   tzx_next_block(tp); break;
         }
 
-        if (tp->i_blk >= tp->nblk) { tp->done = 1; break; }
+        /* After proc: check if we advanced past the last block.
+         * If the block just set a trailing pause, honour it before stopping;
+         * the next loop iteration will clear pause_end_at via the step-2 path
+         * and then line 1279 will set done=1. */
+        if (tp->i_blk >= tp->nblk) {
+            if (!tp->pause_end_at) { tp->done = 1; }
+            break;
+        }
 
         /* 8. Stall guard: nothing changed → stop to avoid infinite loop */
         if (tp->i_blk == old_blk &&
