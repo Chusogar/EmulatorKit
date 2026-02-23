@@ -123,6 +123,7 @@ struct tzx_player {
     uint32_t gen_data_ofs;    /* offset de lectura en dataStream */
     uint8_t  gen_data_byte;
     int      gen_data_bits_left;
+    uint64_t gen_last_edge_t; /* t-state of last EAR edge; used to chain symbols accurately */
 
     /* error */
     char     last_error[128];
@@ -193,7 +194,7 @@ void tzx_rewind(tzx_player_t* tp){
     tp->gen_sym_ip=0; tp->gen_sym_rem=0;
     tp->gen_pilot_pos=0; tp->gen_pilot_rep_left=0;
     tp->gen_data_pos=0; tp->gen_data_dsize=0; tp->gen_data_ofs=0;
-    tp->gen_data_bits_left=0; tp->gen_bits=0;
+    tp->gen_data_bits_left=0; tp->gen_bits=0; tp->gen_last_edge_t=0;
 }
 
 /* ================ indexado de bloques ======================= */
@@ -955,16 +956,17 @@ static void tzx_parse_generalized_tables(tzx_player_t* tp)
     tp->gen_cur_sym = NULL; tp->gen_sym_ip=0; tp->gen_sym_rem=0;
     tp->gen_data_pos = 0; tp->gen_data_ofs = tp->gen_ofs_dataStream;
     tp->gen_data_bits_left = 0; tp->gen_data_byte=0;
+    tp->gen_last_edge_t = 0;
 }
 
-static void gen_start_symbol(tzx_player_t* tp, const tzx_symbol_t* s, uint64_t t_now)
+static void gen_start_symbol(tzx_player_t* tp, const tzx_symbol_t* s, uint64_t base_t)
 {
     /* aplicar flags de nivel */
     switch (s->flags & 3){
-        case 0: TZX_EAR_TOGGLE(tp, t_now); break;
+        case 0: TZX_EAR_TOGGLE(tp, base_t); break;
         case 1: /* igual */ break;
-        case 2: TZX_EAR_SET(tp, t_now, 0); break;
-        case 3: TZX_EAR_SET(tp, t_now, 1); break;
+        case 2: TZX_EAR_SET(tp, base_t, 0); break;
+        case 3: TZX_EAR_SET(tp, base_t, 1); break;
     }
     tp->gen_cur_sym = s;
     tp->gen_sym_ip  = 0;
@@ -975,11 +977,12 @@ static void gen_start_symbol(tzx_player_t* tp, const tzx_symbol_t* s, uint64_t t
         uint16_t dur = s->pulses[tp->gen_sym_ip++];
         tp->gen_sym_rem--;
         if (dur){
-            tp->next_edge_at = t_now + dur;
+            tp->next_edge_at = base_t + dur;
             return;
         }
     }
     tp->gen_cur_sym = NULL; /* símbolo vacío */
+    tp->gen_last_edge_t = base_t; /* advance anchor for next symbol */
     tp->next_edge_at = 0;
 }
 
@@ -987,16 +990,19 @@ static int gen_advance_symbol(tzx_player_t* tp, uint64_t t_now)
 {
     /* llamado cuando hemos alcanzado next_edge_at: hacemos toggle y buscamos siguiente pulso */
     if (!tp->gen_cur_sym) return 1; /* terminado */
-    TZX_EAR_TOGGLE(tp, tp->next_edge_at);
+    uint64_t edge_t = tp->next_edge_at; /* exact time of this edge */
+    (void)t_now; /* not needed: next edge is relative to edge_t, not to caller's t_now */
+    TZX_EAR_TOGGLE(tp, edge_t);
     while (tp->gen_sym_rem > 0){
         uint16_t dur = tp->gen_cur_sym->pulses[tp->gen_sym_ip++];
         tp->gen_sym_rem--;
         if (dur){
-            tp->next_edge_at = t_now + dur;
+            tp->next_edge_at = edge_t + dur; /* base off previous edge, not t_now */
             return 0; /* sigue dentro del símbolo */
         }
     }
     tp->gen_cur_sym = NULL;
+    tp->gen_last_edge_t = edge_t; /* record for chaining next symbol */
     tp->next_edge_at = 0;
     return 1; /* símbolo terminado */
 }
@@ -1083,6 +1089,9 @@ static void tzx_proc_gen(tzx_player_t* tp, uint64_t t_now)
      * la especificación TZX) compuesto íntegramente de símbolos de pulso cero. */
     int guard = 65536;
     while (!tp->done && !tp->next_edge_at && tp->gen_cur_sym == NULL && guard-- > 0){
+        /* Use accumulated edge time for accurate symbol chaining; fall back to t_now
+         * only for the very first symbol in a block (gen_last_edge_t == 0). */
+        uint64_t base_t = tp->gen_last_edge_t ? tp->gen_last_edge_t : t_now;
         if (tp->gen_phase == 0){
             if (tp->gen_pilot_rep_left == 0){
                 uint8_t sidx; uint16_t rep;
@@ -1093,7 +1102,7 @@ static void tzx_proc_gen(tzx_player_t* tp, uint64_t t_now)
                 tp->gen_pilot_sym_idx = sidx;
                 tp->gen_pilot_rep_left = rep;
             }
-            gen_start_symbol(tp, &tp->gen_symP[tp->gen_pilot_sym_idx], t_now);
+            gen_start_symbol(tp, &tp->gen_symP[tp->gen_pilot_sym_idx], base_t);
             /* Símbolo vacío (todos los pulsos cero): contarlo como completado de inmediato */
             if (tp->gen_cur_sym == NULL && !tp->next_edge_at){
                 if (tp->gen_pilot_rep_left > 0) tp->gen_pilot_rep_left--;
@@ -1108,7 +1117,7 @@ static void tzx_proc_gen(tzx_player_t* tp, uint64_t t_now)
                                             &tp->gen_data_byte, &sidx)){
                 tp->gen_phase = 2; continue;
             }
-            gen_start_symbol(tp, &tp->gen_symD[sidx], t_now);
+            gen_start_symbol(tp, &tp->gen_symD[sidx], base_t);
             tp->gen_data_pos++;
         } else { /* phase 2: pausa/done */
             if (tp->gen_pause){
