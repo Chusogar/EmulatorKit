@@ -11,7 +11,7 @@
  *   - TAP fast loader: injects CODE/SCREEN$ blocks to param1 address, no EAR/timing
  *   - TAP pulse player (ROM-accurate): pilot/sync/bits/pauses on EAR input
  *   - TZX pulse player: full TZX support via tzx.c (blocks 0x10-0x19, control)
- *   - Beeper (EAR|MIC) audio via SDL2 (queue mode)
+ *   - Beeper (EAR|MIC) audio via SDL2 (callback + ring buffer, dynamic resampling)
  *   - Hotkeys: F6 (reload TAP & autostart fast), F7 (list TAP),
  *              F8 (Play/Pause tape/TZX pulses), F9 (Rewind tape/TZX pulses)
  *
@@ -129,12 +129,12 @@ static int trace = 0;
 static void reti_event(void);
 
 /* ─────────────────────────────────────────────────────────────
- * Beeper (EAR/MIC) + SDL2 audio queue (mono, S16)
+ * Beeper (EAR/MIC) + SDL2 audio callback (mono, S16)
+ * Ring buffer with dynamic re-sampling to follow emulator speed.
  * ───────────────────────────────────────────────────────────── */
 /* TSTATES_CPU is defined in tape.h */
 
 static SDL_AudioDeviceID audio_dev = 0;
-static SDL_AudioSpec have;
 static int audio_rate = 44100;
 static float beeper_volume = 0.30f;
 static float tape_volume   = 0.15f;  /* volume for tape EAR-in signal */
@@ -151,14 +151,88 @@ static double   beeper_frac_acc     = 0.0;
 /* AY-3-8912 PSG (128K/+3 only; NULL on 48K). */
 static ay8912_t *ay = NULL;
 
+/* ── Ring buffer (SPSC, protected by SDL_LockAudioDevice) ── */
+/* 131072 samples ≈ 3 s @ 44100 Hz; power-of-2 for index masking */
+#define RB_CAP    (1 << 17)
+#define RB_MASK   (RB_CAP - 1)
+/* Target fill ≈ 371 ms: ratio = fill/target drives resampling speed */
+#define RB_TARGET (RB_CAP / 8)
+
+static int16_t  rb_buf[RB_CAP];
+static uint32_t rb_wr = 0;       /* write index – main thread (lock held) */
+static uint32_t rb_rd = 0;       /* read  index – callback   (lock held) */
+static double   cb_read_frac = 0.0; /* fractional sub-sample offset [0,1) */
+
+/* Write n samples into ring buffer.  Caller must hold SDL audio lock.
+ * When full, oldest samples are silently dropped to bound latency. */
+static void rb_push(const int16_t *src, int n)
+{
+    for (int i = 0; i < n; i++) {
+        if ((rb_wr - rb_rd) >= (uint32_t)RB_CAP)
+            rb_rd++;   /* buffer full: drop oldest sample */
+        rb_buf[rb_wr & RB_MASK] = src[i];
+        rb_wr++;
+    }
+}
+
+/* SDL audio callback – called from the SDL audio thread.
+ * Reads from ring buffer with dynamic linear resampling:
+ *   ratio > 1 → speed up  (fast/turbo mode, high fill)
+ *   ratio < 1 → slow down (buffer nearly empty)
+ * Underrun (empty buffer) → silence. */
+static void audio_callback(void *userdata, Uint8 *stream, int len)
+{
+    (void)userdata;
+    int16_t *out  = (int16_t *)stream;
+    int      nout = len / (int)sizeof(int16_t);
+
+    uint32_t fill = rb_wr - rb_rd;
+
+    if (fill == 0) {
+        /* Underrun: output silence */
+        memset(stream, 0, (size_t)len);
+        return;
+    }
+
+    /* Dynamic ratio: clamp to [0.25, 8.0] to avoid extreme artefacts */
+    double ratio = (double)fill / (double)RB_TARGET;
+    if (ratio < 0.25) ratio = 0.25;
+    if (ratio > 8.0)  ratio = 8.0;
+
+    for (int i = 0; i < nout; i++) {
+        uint32_t cur_fill = rb_wr - rb_rd;
+        if (cur_fill == 0) {
+            /* Underrun mid-frame: fill rest with silence */
+            memset(out + i, 0, (size_t)(nout - i) * sizeof(int16_t));
+            break;
+        }
+
+        /* cb_read_frac ∈ [0,1): interpolate rb_rd[0] and rb_rd[1] */
+        int16_t s0 = rb_buf[rb_rd & RB_MASK];
+        int16_t s1 = (cur_fill >= 2) ? rb_buf[(rb_rd + 1) & RB_MASK] : s0;
+        out[i] = (int16_t)((double)s0 * (1.0 - cb_read_frac) +
+                           (double)s1 * cb_read_frac);
+
+        cb_read_frac += ratio;
+
+        /* Advance read pointer by consumed whole samples */
+        uint32_t advance = (uint32_t)cb_read_frac;
+        if (advance > cur_fill) advance = cur_fill;
+        rb_rd        += advance;
+        cb_read_frac -= (double)advance;
+    }
+}
+
 static int audio_init_sdl(int rate)
 {
-    SDL_AudioSpec want;
+    SDL_AudioSpec want, have;
     SDL_zero(want);
-    want.freq = rate;
-    want.format = AUDIO_S16SYS;
+    want.freq     = rate;
+    want.format   = AUDIO_S16SYS;
     want.channels = 1;
-    want.samples = 2048;
+    want.samples  = 2048;
+    want.callback = audio_callback;
+    want.userdata = NULL;
 
     audio_dev = SDL_OpenAudioDevice(NULL, 0, &want, &have, 0);
     if (!audio_dev) {
@@ -209,7 +283,10 @@ static inline void beeper_advance_to(uint64_t t_now)
             int16_t val = (int16_t)(mixed * 32767.0f);
             for (int i = 0; i < n; ++i) buf[i] = val;
         }
-        SDL_QueueAudio(audio_dev, buf, n * (int)sizeof(int16_t));
+        /* Write samples to ring buffer (lock ensures callback exclusion) */
+        SDL_LockAudioDevice(audio_dev);
+        rb_push(buf, n);
+        SDL_UnlockAudioDevice(audio_dev);
         nsamp -= n;
     }
 }
