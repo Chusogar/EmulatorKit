@@ -115,7 +115,7 @@ struct tzx_player {
     /* pilot stream */
     uint32_t gen_pilot_pos;   /* símbolo # actual dentro de totp */
     uint8_t  gen_pilot_sym_idx;
-    uint16_t gen_pilot_rep_left;
+    uint32_t gen_pilot_rep_left;
     /* data stream */
     int      gen_bits;        /* bits por símbolo (ceil log2(asd)) */
     uint32_t gen_data_pos;    /* símbolo # consumidos */
@@ -248,6 +248,10 @@ static int tzx_build_block_index(tzx_player_t* tp)
         case 0x18:
             if (p+4+2+3+1+4 > tp->len) goto trunc;
             advance = 4+2+3+1+4 + rd_le32(&tp->buf[p]);
+            break;
+        case 0x19:
+            if (p+4 > tp->len) goto trunc;
+            advance = 4 + rd_le32(&tp->buf[p]);
             break;
         case 0x20: advance = 2; break;
         case 0x21: if (p+1 > tp->len) goto trunc; advance=1+tp->buf[p]; break;
@@ -820,6 +824,210 @@ static void tzx_proc_csw(tzx_player_t* tp, uint64_t t_now)
 }
 
 
+/* Returns ceil(log2(n)); returns 0 for n<=1. */
+static int ceil_log2(uint32_t n)
+{
+    if (n <= 1) return 0;
+    int bits = 0;
+    n--;
+    while (n > 0) { bits++; n >>= 1; }
+    return bits;
+}
+
+/* Parse the pilot/sync and data symbol alphabets from a 0x19 block payload.
+ * Idempotent: returns immediately if already loaded (gen_loaded==1). */
+static void tzx_parse_generalized_tables(tzx_player_t* tp)
+{
+    if (tp->gen_loaded) return;
+
+    uint32_t plen; const uint8_t* p = cur_payload(tp, &plen);
+
+    /* Fixed header: 4(blen)+2(pause)+4(totp)+1(npp)+1(asp)+4(totd)+1(npd)+1(asd) = 18 */
+    if (plen < 18) {
+        tzx_set_error(tp, "0x19: payload too short");
+        tp->done = 1; return;
+    }
+    uint32_t blen     = rd_le32(p + 0);
+    uint16_t pause_ms = rd_le16(p + 4);
+    uint32_t totp     = rd_le32(p + 6);
+    uint8_t  npp      = p[10];
+    uint16_t asp      = p[11] ? p[11] : 256; /* TZX spec: 0 means 256 */
+    uint32_t totd     = rd_le32(p + 12);
+    uint8_t  npd      = p[16];
+    uint16_t asd      = p[17] ? p[17] : 256; /* TZX spec: 0 means 256 */
+
+    if (4 + blen > plen) {
+        tzx_set_error(tp, "0x19: block truncated");
+        tp->done = 1; return;
+    }
+
+    /* Clamp pulse counts to our internal maximum */
+    if (npp > TZX_MAX_PULSES) npp = TZX_MAX_PULSES;
+    if (npd > TZX_MAX_PULSES) npd = TZX_MAX_PULSES;
+
+    uint32_t sym_p_size = 1 + (uint32_t)npp * 2;   /* bytes per pilot/sync symdef */
+    uint32_t sym_d_size = 1 + (uint32_t)npd * 2;   /* bytes per data symdef */
+
+    /* NB = ceil(log2(asd)) bits per data symbol */
+    uint32_t nb = (uint32_t)ceil_log2((uint32_t)asd);
+
+    /* Data stream size = ceil(NB * TOTD / 8).
+     * Use 64-bit arithmetic to avoid overflow; the result is bounded by blen. */
+    uint64_t dsb64 = (totd > 0 && nb > 0) ? (nb * (uint64_t)totd + 7) / 8 : 0;
+    if (dsb64 > blen) {
+        tzx_set_error(tp, "0x19: data stream size exceeds block length");
+        tp->done = 1; return;
+    }
+    uint32_t data_stream_bytes = (uint32_t)dsb64;
+
+    /* Layout within payload (offsets are relative to payload start, i.e. after block ID):
+     *   [0..3]   blen
+     *   [4..17]  fixed header fields
+     *   [18..)   pilot alphabet (only if TOTP>0): asp * sym_p_size bytes
+     *            pilot stream PRLE (only if TOTP>0): prle_size bytes
+     *            data alphabet (only if TOTD>0): asd * sym_d_size bytes
+     *            data stream (only if TOTD>0): data_stream_bytes bytes
+     */
+    uint32_t pilot_alpha_size = (totp > 0) ? (uint32_t)asp * sym_p_size : 0;
+    uint32_t data_alpha_size  = (totd > 0) ? (uint32_t)asd * sym_d_size : 0;
+
+    /* blen = 14 + pilot_alpha_size + prle_size + data_alpha_size + data_stream_bytes */
+    uint32_t fixed_after_blen = 14u; /* bytes 4..17 */
+    if (blen < fixed_after_blen + pilot_alpha_size + data_alpha_size + data_stream_bytes) {
+        tzx_set_error(tp, "0x19: blen too small for declared content");
+        tp->done = 1; return;
+    }
+    uint32_t prle_size = blen - fixed_after_blen - pilot_alpha_size
+                              - data_alpha_size - data_stream_bytes;
+
+    uint32_t pilot_alpha_ofs  = 18;
+    uint32_t prle_ofs         = pilot_alpha_ofs + pilot_alpha_size;
+    uint32_t data_alpha_ofs   = prle_ofs + prle_size;
+    uint32_t data_stream_ofs  = data_alpha_ofs + data_alpha_size;
+
+    tp->gen_blen          = blen;
+    tp->gen_pause         = pause_ms;
+    tp->gen_totp          = totp;
+    tp->gen_npp           = npp;
+    tp->gen_asp           = asp;
+    tp->gen_totd          = totd;
+    tp->gen_npd           = npd;
+    tp->gen_asd           = asd;
+    tp->gen_ofs_alphaP    = pilot_alpha_ofs;
+    tp->gen_ofs_pilotStream = prle_ofs;
+    tp->gen_ofs_alphaD    = data_alpha_ofs;
+    tp->gen_ofs_dataStream = data_stream_ofs;
+    tp->gen_data_dsize    = data_stream_bytes;
+    tp->gen_bits          = (int)nb;
+
+    /* Parse pilot/sync symbol alphabet */
+    memset(tp->gen_symP, 0, sizeof(tp->gen_symP));
+    if (totp > 0) {
+        uint32_t ofs = pilot_alpha_ofs;
+        for (uint32_t i = 0; i < (uint32_t)asp; i++) {
+            if (ofs + sym_p_size > plen) {
+                tzx_set_error(tp, "0x19: pilot alphabet truncated");
+                tp->done = 1; return;
+            }
+            tp->gen_symP[i].flags   = p[ofs];
+            int effective = 0;
+            for (int j = 0; j < npp; j++) {
+                uint16_t dur = rd_le16(p + ofs + 1 + j * 2);
+                tp->gen_symP[i].pulses[j] = dur;
+                if (dur) effective = j + 1;
+            }
+            /* npulses = highest non-zero pulse index + 1 (ignore trailing zeros);
+             * 0 if all pulses are zero (empty/terminating symbol). */
+            tp->gen_symP[i].npulses = (uint8_t)effective;
+            ofs += sym_p_size;
+        }
+    }
+
+    /* Parse data symbol alphabet */
+    memset(tp->gen_symD, 0, sizeof(tp->gen_symD));
+    if (totd > 0) {
+        uint32_t ofs = data_alpha_ofs;
+        for (uint32_t i = 0; i < (uint32_t)asd; i++) {
+            if (ofs + sym_d_size > plen) {
+                tzx_set_error(tp, "0x19: data alphabet truncated");
+                tp->done = 1; return;
+            }
+            tp->gen_symD[i].flags   = p[ofs];
+            int effective = 0;
+            for (int j = 0; j < npd; j++) {
+                uint16_t dur = rd_le16(p + ofs + 1 + j * 2);
+                tp->gen_symD[i].pulses[j] = dur;
+                if (dur) effective = j + 1;
+            }
+            /* npulses = highest non-zero pulse index + 1; 0 for all-zero (empty) symbols. */
+            tp->gen_symD[i].npulses = (uint8_t)effective;
+            ofs += sym_d_size;
+        }
+    }
+
+    tp->gen_pilot_pos      = 0;
+    tp->gen_pilot_rep_left = 0;
+    tp->gen_loaded = 1;
+
+    TZX_TRACEF("[TZX] 0x19 tables: blen=%u pause=%ums totp=%u npp=%u asp=%u"
+               " totd=%u npd=%u asd=%u nb=%u dsize=%u\n",
+        blen, pause_ms, totp, npp, asp, totd, npd, asd, nb, data_stream_bytes);
+    TZX_TRACEF("[TZX] 0x19 offsets: alphaP=%u prle=%u prle_sz=%u alphaD=%u dataS=%u\n",
+        pilot_alpha_ofs, prle_ofs, prle_size, data_alpha_ofs, data_stream_ofs);
+}
+
+/* Read the next PRLE entry from the pilot/sync stream.
+ * Returns 1 and fills *sym_idx and *rep if an entry exists; 0 if stream exhausted.
+ * A stored rep==0 means 65536 repetitions per the TZX specification. */
+static int gen_read_pilot_entry(tzx_player_t* tp, uint8_t* sym_idx, uint32_t* rep)
+{
+    /* PRLE stream spans [gen_ofs_pilotStream .. gen_ofs_alphaD) in payload */
+    uint32_t cur_ofs = tp->gen_ofs_pilotStream + tp->gen_pilot_pos;
+    if (cur_ofs + 3 > tp->gen_ofs_alphaD) return 0;  /* stream exhausted */
+
+    uint32_t plen; const uint8_t* p = cur_payload(tp, &plen);
+    if (cur_ofs + 3 > plen) return 0;
+
+    *sym_idx = p[cur_ofs];
+    uint16_t r = rd_le16(p + cur_ofs + 1);
+    *rep = (r == 0) ? 65536u : (uint32_t)r;
+
+    tp->gen_pilot_pos += 3;  /* advance byte offset by one 3-byte PRLE entry */
+    return 1;
+}
+
+/* Read the next NB-bit symbol index from the data stream (MSB-first bit order).
+ * State is maintained via the passed-in pointers (ofs, bits_left, cur_byte).
+ * Returns 1 and sets *sym_idx on success; 0 if stream exhausted or index OOB. */
+static int gen_read_data_symbol_index(tzx_player_t* tp,
+                                      uint32_t* ofs, int* bits_left,
+                                      uint8_t* cur_byte, uint32_t* sym_idx)
+{
+    int nb = tp->gen_bits;
+    if (nb == 0) { *sym_idx = 0; return 1; }  /* asd==1: only symbol 0 exists */
+
+    uint32_t plen; const uint8_t* p = cur_payload(tp, &plen);
+    uint32_t data_end = tp->gen_ofs_dataStream + tp->gen_data_dsize;
+
+    uint32_t result = 0;
+    for (int i = 0; i < nb; i++) {
+        if (*bits_left == 0) {
+            if (*ofs >= data_end || *ofs >= plen) return 0;
+            *cur_byte   = p[*ofs];
+            (*ofs)++;
+            *bits_left  = 8;
+        }
+        /* MSB-first: consume the most-significant bit */
+        result     = (result << 1) | ((*cur_byte >> 7) & 1u);
+        *cur_byte <<= 1;
+        (*bits_left)--;
+    }
+
+    if (result >= (uint32_t)tp->gen_asd) return 0;
+    *sym_idx = result;
+    return 1;
+}
+
 static void gen_start_symbol(tzx_player_t* tp, const tzx_symbol_t* s, uint64_t t_now)
 {
     /* Anchor new symbol to the time the previous symbol ended (gen_last_edge_t).
@@ -924,7 +1132,7 @@ static void tzx_proc_gen(tzx_player_t* tp, uint64_t t_now)
     while (!tp->done && !tp->next_edge_at && tp->gen_cur_sym == NULL && guard-- > 0){
         if (tp->gen_phase == 0){
             if (tp->gen_pilot_rep_left == 0){
-                uint8_t sidx; uint16_t rep;
+                uint8_t sidx; uint32_t rep;
                 if (!gen_read_pilot_entry(tp, &sidx, &rep)){
                     if (tp->gen_totd){
                         /* Reset data stream reader to avoid bit/byte desynchronisation
@@ -1093,6 +1301,7 @@ static void tzx_advance_to(tzx_player_t* tp, uint64_t t_now)
             tp->i_byte = 0; tp->bit_mask = 0x80; tp->subpulse = 0;
             tp->gen_cur_sym = NULL;
             tp->gen_inited = 0;
+            tp->gen_loaded = 0;
             tp->next_edge_at = 0;  /* ensure init condition triggers for the new block */
             prev_blk = tp->i_blk;
         }
@@ -1119,7 +1328,7 @@ static void tzx_advance_to(tzx_player_t* tp, uint64_t t_now)
 
         /* 4. Initialize new signal block (anchored to t_now for accurate timing) */
         int need_init = (tp->sub_ofs == 0 && tp->sub_len == 0 && tp->next_edge_at == 0 &&
-                         tp->pilot_left == 0 && tp->gen_cur_sym == NULL);
+                         tp->pilot_left == 0 && tp->gen_cur_sym == NULL && !tp->gen_inited);
         if (need_init) {
             tp->slice_origin = t_now;  /* anchor first-edge to current time */
 #if TZX_TRACE
@@ -1134,6 +1343,7 @@ static void tzx_advance_to(tzx_player_t* tp, uint64_t t_now)
             case 0x14: tzx_init_pure_data(tp); break;
             case 0x15: tzx_init_direct(tp); break;
             case 0x18: tzx_init_csw(tp); break;
+            case 0x19: tzx_init_gen(tp); break;
             default:   tzx_next_block(tp); continue;
             }
             /* If init triggered a pause (e.g. no-data direct), restart loop */
@@ -1156,6 +1366,7 @@ static void tzx_advance_to(tzx_player_t* tp, uint64_t t_now)
         case 0x14: tzx_proc_pure_data(tp, t_now); break;
         case 0x15: tzx_proc_direct(tp, t_now); break;
         case 0x18: tzx_proc_csw(tp, t_now); break;
+        case 0x19: tzx_proc_gen(tp, t_now); break;
         default:   tzx_next_block(tp); break;
         }
 
