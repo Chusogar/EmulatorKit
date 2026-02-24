@@ -980,6 +980,11 @@ static void run_scanlines(unsigned lines, unsigned blank)
         border_end_slice();
         beeper_end_slice();
 
+        /* Tick the FDC once per scanline so timeouts advance at roughly
+           the correct rate (rather than once per full 312-line frame). */
+        if (fdc)
+            fdc_tick(fdc);
+
         if (!blanked)
             drawline++;
     }
@@ -1197,7 +1202,7 @@ int main(int argc, char *argv[])
         if (patha) {
             drive_a = fd_newdsk();
             fd_settype(drive_a, FD_30);
-            fd_setheads(drive_a, 1);
+            fd_setheads(drive_a, 2);
             fd_setcyls(drive_a, 40);
             fdd_setfilename(drive_a, patha);
             printf("Attached disk '%s' as A\n", patha);
@@ -1205,11 +1210,13 @@ int main(int argc, char *argv[])
             drive_a = fd_new();
 
         if (pathb) {
+            /* ZX +3 drive B: same 3" 40-track hardware as drive A */
             drive_b = fd_newdsk();
-            fd_settype(drive_a, FD_35);
-            fd_setheads(drive_a, 2);
-            fd_setcyls(drive_a, 80);
-            fdd_setfilename(drive_a, pathb);
+            fd_settype(drive_b, FD_30);
+            fd_setheads(drive_b, 2);
+            fd_setcyls(drive_b, 40);
+            fdd_setfilename(drive_b, pathb);
+            printf("Attached disk '%s' as B\n", pathb);
         } else
             drive_b = fd_new();
 
@@ -1386,8 +1393,6 @@ int main(int argc, char *argv[])
         /* Do a small block of I/O and delays */
         if (!fast)
             nanosleep(&tc, NULL);
-        if (fdc)
-            fdc_tick(fdc);
     }
 
     if (audio_dev) {
