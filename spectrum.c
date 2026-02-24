@@ -49,6 +49,7 @@
 #include <SDL2/SDL.h>
 #include "event.h"
 #include "keymatrix.h"
+#include "ay8912.h"
 
 static SDL_Window *window;
 static SDL_Renderer *render;
@@ -137,6 +138,7 @@ static SDL_AudioSpec have;
 static int audio_rate = 44100;
 static float beeper_volume = 0.30f;
 static float tape_volume   = 0.15f;  /* volume for tape EAR-in signal */
+static float ay_volume     = 0.50f;  /* volume for AY-3-8912 output */
 
 static uint64_t beeper_frame_origin = 0;
 static uint64_t beeper_slice_origin = 0;
@@ -145,6 +147,9 @@ static int      beeper_level        = 0;   /* 0 o 1 (onda cuadrada) */
 static int      tape_ear_level      = 0;   /* 0 o 1: EAR input from tape/TZX */
 static int      tape_ear_active     = 0;   /* 1 when tape/TZX is playing */
 static double   beeper_frac_acc     = 0.0;
+
+/* AY-3-8912 PSG (128K/+3 only; NULL on 48K). */
+static ay8912_t *ay = NULL;
 
 static int audio_init_sdl(int rate)
 {
@@ -183,16 +188,27 @@ static inline void beeper_advance_to(uint64_t t_now)
      * Gate the tape contribution so silence when nothing is playing. */
     float bv = beeper_level ? beeper_volume : -beeper_volume;
     float tv = tape_ear_active ? (tape_ear_level ? tape_volume : -tape_volume) : 0.0f;
-    float mixed = bv + tv;
-    if (mixed >  1.0f) mixed =  1.0f;
-    if (mixed < -1.0f) mixed = -1.0f;
-    int16_t val = (int16_t)(mixed * 32767.0f);
 
     enum { CHUNK = 4096 };
     static int16_t buf[CHUNK];
     while (nsamp > 0) {
         int n = (nsamp > CHUNK) ? CHUNK : nsamp;
-        for (int i = 0; i < n; ++i) buf[i] = val;
+        if (ay) {
+            /* 128K/+3: step the AY PSG once per sample and mix. */
+            for (int i = 0; i < n; ++i) {
+                float mixed = bv + tv +
+                    (float)ay8912_calc(ay) * ay_volume / AY8912_MAX_OUTPUT;
+                if (mixed >  1.0f) mixed =  1.0f;
+                if (mixed < -1.0f) mixed = -1.0f;
+                buf[i] = (int16_t)(mixed * 32767.0f);
+            }
+        } else {
+            float mixed = bv + tv;
+            if (mixed >  1.0f) mixed =  1.0f;
+            if (mixed < -1.0f) mixed = -1.0f;
+            int16_t val = (int16_t)(mixed * 32767.0f);
+            for (int i = 0; i < n; ++i) buf[i] = val;
+        }
         SDL_QueueAudio(audio_dev, buf, n * (int)sizeof(int16_t));
         nsamp -= n;
     }
@@ -737,6 +753,16 @@ static uint8_t io_read(int unused, uint16_t addr)
     /* Timex checks XXFE, Sinclair just the low bit */
     if ((addr & 0x01) == 0) /* ULA */
         return ula_read(addr);
+    /* AY-3-8912: IN 0xFFFD reads the currently selected register (128K/+3 only).
+     * Advance audio to current t-state first to preserve event ordering. */
+    if ((model == ZX_128K || model == ZX_PLUS3) && (addr & 0xC002) == 0xC000) {
+        if (ay) {
+            uint64_t t_now = beeper_slice_origin + (uint64_t)cpu_z80.tstates;
+            beeper_advance_to(t_now);
+            return ay8912_read_data(ay);
+        }
+        return 0xFF;
+    }
     if (model == ZX_PLUS3) {
         if ((addr & 0xF002) == 0x2000)
             return fdc_read_ctrl(fdc);
@@ -792,6 +818,22 @@ static void io_write(int unused, uint16_t addr, uint8_t val)
         else
             fdc_set_motor(fdc, 0);
         recalc_mmu();
+    }
+    /* AY-3-8912 ports (128K/+3 only).
+     * Advance audio to the current t-state before changing AY state so
+     * that the register write lands at the correct position in the stream. */
+    if ((model == ZX_128K || model == ZX_PLUS3) && ay) {
+        if ((addr & 0xC002) == 0xC000) {
+            /* OUT 0xFFFD: select AY register */
+            uint64_t t_now = beeper_slice_origin + (uint64_t)cpu_z80.tstates;
+            beeper_advance_to(t_now);
+            ay8912_select_reg(ay, val);
+        } else if ((addr & 0xC002) == 0x8000) {
+            /* OUT 0xBFFD: write data to selected AY register */
+            uint64_t t_now = beeper_slice_origin + (uint64_t)cpu_z80.tstates;
+            beeper_advance_to(t_now);
+            ay8912_write_data(ay, val);
+        }
     }
     if (divide) {
         if ((addr & 0xE3) == 0xA3) {
@@ -1280,6 +1322,12 @@ int main(int argc, char *argv[])
         beeper_last_tstate  = 0;
         beeper_level        = 0;
         beeper_frac_acc     = 0.0;
+        /* AY-3-8912: present on 128K/+3 only, clocked at CPU_CLK/2. */
+        if (model == ZX_128K || model == ZX_PLUS3) {
+            ay = ay8912_create((uint32_t)(TSTATES_CPU / 2), (uint32_t)audio_rate);
+            if (!ay)
+                fprintf(stderr, "Aviso: no se pudo inicializar el AY-3-8912.\n");
+        }
     }
 
     /* TAP (fast) – inyección directa */
@@ -1394,6 +1442,8 @@ int main(int argc, char *argv[])
         SDL_CloseAudioDevice(audio_dev);
         audio_dev = 0;
     }
+    ay8912_destroy(ay);
+    ay = NULL;
     tzx_destroy(tzx_player);
     exit(0);
 }
