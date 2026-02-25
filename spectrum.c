@@ -187,7 +187,7 @@ static inline void beeper_advance_to(uint64_t t_now)
 
     /* Mix beeper (EAR/MIC out) with tape EAR-in signal.
      * Gate the tape contribution so silence when nothing is playing. */
-    float bv = beeper_level ? beeper_volume : -beeper_volume;
+    float bv = beeper_level ? beeper_volume : 0;
     float tv = tape_ear_active ? (tape_ear_level ? tape_volume : -tape_volume) : 0.0f;
 
     enum { CHUNK = 256 };
@@ -1439,8 +1439,11 @@ int main(int argc, char *argv[])
          */
         border_begin_frame();
         run_scanlines(64, 0);
+		beeper_advance_to(64 * 224);
         run_scanlines(192, 1);
+		beeper_advance_to(192 * 224);
         run_scanlines(56, 0);
+		beeper_advance_to(56 * 224);
         spectrum_rasterize();
         spectrum_render();
         Z80INT(&cpu_z80, 0xFF);
