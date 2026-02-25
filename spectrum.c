@@ -58,6 +58,7 @@ static SDL_Texture *texture;
 #define BORDER  32
 #define WIDTH   (256 + 2 * BORDER)
 #define HEIGHT  (192 + 2 * BORDER)
+#define SCALE	1
 
 static uint32_t texturebits[WIDTH * HEIGHT];
 
@@ -158,7 +159,7 @@ static int audio_init_sdl(int rate)
     want.freq = rate;
     want.format = AUDIO_S16SYS;
     want.channels = 1;
-    want.samples = 2048;
+    want.samples = 256;
 
     audio_dev = SDL_OpenAudioDevice(NULL, 0, &want, &have, 0);
     if (!audio_dev) {
@@ -178,7 +179,7 @@ static inline void beeper_advance_to(uint64_t t_now)
     uint64_t dt = t_now - beeper_last_tstate;
     beeper_last_tstate = t_now;
 
-    double add = (double)dt * (double)audio_rate / TSTATES_CPU;
+    double add = (double)dt * (((double)audio_rate / TSTATES_CPU)/1);
     beeper_frac_acc += add;
     int nsamp = (int)beeper_frac_acc;
     if (nsamp <= 0) return;
@@ -189,7 +190,7 @@ static inline void beeper_advance_to(uint64_t t_now)
     float bv = beeper_level ? beeper_volume : -beeper_volume;
     float tv = tape_ear_active ? (tape_ear_level ? tape_volume : -tape_volume) : 0.0f;
 
-    enum { CHUNK = 4096 };
+    enum { CHUNK = 256 };
     static int16_t buf[CHUNK];
     while (nsamp > 0) {
         int n = (nsamp > CHUNK) ? CHUNK : nsamp;
@@ -229,15 +230,26 @@ static inline void beeper_end_slice(void)
 static inline void beeper_set_level(int level_now)
 {
     uint64_t t_now = beeper_slice_origin + (uint64_t)cpu_z80.tstates;
-    beeper_advance_to(t_now);
+	if (level_now != beeper_level)
+	{
+		beeper_advance_to(t_now);
+	}
+    
     beeper_level = level_now ? 1 : 0;
 }
 
 /* EAR=b4, MIC=b3 → modelado sencillo como OR */
 static inline void beeper_set_from_ula(uint8_t v)
 {
-    int level = ((v >> 4) & 1) | ((v >> 3) & 1);
-    beeper_set_level(level);
+    //int level = (((v >> 4) & 1) | ((v >> 3) & 1) | ((v & 0x10) != 0)) != 0 ? 1 : 0;
+	int level = (((v & 0x10) != 0)) != 0 ? 1 : 0; // ear
+	//level |= (((v & 0x08) != 0)) ? 1 : 0; // mic
+	
+	if (beeper_level != level)
+	{
+		beeper_set_level(level);
+	}
+    
 }
 
 /* ─────────────────────────────────────────────────────────────
@@ -751,8 +763,11 @@ static uint8_t io_read(int unused, uint16_t addr)
     }
 
     /* Timex checks XXFE, Sinclair just the low bit */
-    if ((addr & 0x01) == 0) /* ULA */
+    if ((addr & 0x01) == 0) { /* ULA */
+		uint64_t t_now = beeper_slice_origin + (uint64_t)cpu_z80.tstates;
+        beeper_advance_to(t_now);
         return ula_read(addr);
+	}
     /* AY-3-8912: IN 0xFFFD reads the currently selected register (128K/+3 only).
      * Advance audio to current t-state first to preserve event ordering. */
     if ((model == ZX_128K || model == ZX_PLUS3) && (addr & 0xC002) == 0xC000) {
@@ -1267,8 +1282,8 @@ int main(int argc, char *argv[])
     window = SDL_CreateWindow("ZX Spectrum",
                   SDL_WINDOWPOS_UNDEFINED,
                   SDL_WINDOWPOS_UNDEFINED,
-                  WIDTH,
-                  HEIGHT, SDL_WINDOW_RESIZABLE);
+                  WIDTH * SCALE,
+                  HEIGHT * SCALE, SDL_WINDOW_RESIZABLE);
     if (window == NULL) {
         fprintf(stderr,
             "spectrum: unable to open window: %s\n",
