@@ -159,7 +159,7 @@ static int audio_init_sdl(int rate)
     want.freq = rate;
     want.format = AUDIO_S16SYS;
     want.channels = 1;
-    want.samples = 256;
+    want.samples = 512;
 
     audio_dev = SDL_OpenAudioDevice(NULL, 0, &want, &have, 0);
     if (!audio_dev) {
@@ -190,7 +190,7 @@ static inline void beeper_advance_to(uint64_t t_now)
     float bv = beeper_level ? beeper_volume : 0;
     float tv = tape_ear_active ? (tape_ear_level ? tape_volume : -tape_volume) : 0.0f;
 
-    enum { CHUNK = 256 };
+    enum { CHUNK = 4096 };
     static int16_t buf[CHUNK];
     while (nsamp > 0) {
         int n = (nsamp > CHUNK) ? CHUNK : nsamp;
@@ -229,13 +229,13 @@ static inline void beeper_end_slice(void)
 
 static inline void beeper_set_level(int level_now)
 {
-    uint64_t t_now = beeper_slice_origin + (uint64_t)cpu_z80.tstates;
-	if (level_now != beeper_level)
+	if (beeper_level != level_now)
 	{
+		uint64_t t_now = beeper_slice_origin + (uint64_t)cpu_z80.tstates;
 		beeper_advance_to(t_now);
+		beeper_level = level_now ? 1 : 0;
 	}
     
-    beeper_level = level_now ? 1 : 0;
 }
 
 /* EAR=b4, MIC=b3 → modelado sencillo como OR */
@@ -243,9 +243,10 @@ static inline void beeper_set_from_ula(uint8_t v)
 {
     //int level = (((v >> 4) & 1) | ((v >> 3) & 1) | ((v & 0x10) != 0)) != 0 ? 1 : 0;
 	int level = (((v & 0x10) != 0)) != 0 ? 1 : 0; // ear
+	//level = (level != 0) ? level : (((v & 0x08) != 0)) ? 1 : 0;
 	//level |= (((v & 0x08) != 0)) ? 1 : 0; // mic
 	
-	if (beeper_level != level)
+	//if (beeper_level != level)
 	{
 		beeper_set_level(level);
 	}
@@ -764,8 +765,8 @@ static uint8_t io_read(int unused, uint16_t addr)
 
     /* Timex checks XXFE, Sinclair just the low bit */
     if ((addr & 0x01) == 0) { /* ULA */
-		uint64_t t_now = beeper_slice_origin + (uint64_t)cpu_z80.tstates;
-        beeper_advance_to(t_now);
+		//uint64_t t_now = beeper_slice_origin + (uint64_t)cpu_z80.tstates;
+        //beeper_advance_to(t_now);
         return ula_read(addr);
 	}
     /* AY-3-8912: IN 0xFFFD reads the currently selected register (128K/+3 only).
@@ -1439,11 +1440,8 @@ int main(int argc, char *argv[])
          */
         border_begin_frame();
         run_scanlines(64, 0);
-		beeper_advance_to(64 * 224);
         run_scanlines(192, 1);
-		beeper_advance_to(192 * 224);
         run_scanlines(56, 0);
-		beeper_advance_to(56 * 224);
         spectrum_rasterize();
         spectrum_render();
         Z80INT(&cpu_z80, 0xFF);
