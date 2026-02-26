@@ -190,29 +190,33 @@ static inline void beeper_advance_to(uint64_t t_now)
     float bv = beeper_level ? beeper_volume : 0;
     float tv = tape_ear_active ? (tape_ear_level ? tape_volume : -tape_volume) : 0.0f;
 
-    enum { CHUNK = 4096 };
-    static int16_t buf[CHUNK];
-    while (nsamp > 0) {
-        int n = (nsamp > CHUNK) ? CHUNK : nsamp;
-        if (ay) {
-            /* 128K/+3: step the AY PSG once per sample and mix. */
-            for (int i = 0; i < n; ++i) {
-                float mixed = bv + tv +
-                    (float)ay8912_calc(ay) * ay_volume / AY8912_MAX_OUTPUT;
-                if (mixed >  1.0f) mixed =  1.0f;
-                if (mixed < -1.0f) mixed = -1.0f;
-                buf[i] = (int16_t)(mixed * 32767.0f);
-            }
-        } else {
-            float mixed = bv + tv;
-            if (mixed >  1.0f) mixed =  1.0f;
-            if (mixed < -1.0f) mixed = -1.0f;
-            int16_t val = (int16_t)(mixed * 32767.0f);
-            for (int i = 0; i < n; ++i) buf[i] = val;
-        }
-        SDL_QueueAudio(audio_dev, buf, n * (int)sizeof(int16_t));
-        nsamp -= n;
-    }
+	if (!fast)
+	{
+			
+		enum { CHUNK = 4096 };
+		static int16_t buf[CHUNK];
+		while (nsamp > 0) {
+			int n = (nsamp > CHUNK) ? CHUNK : nsamp;
+			if (ay) {
+				/* 128K/+3: step the AY PSG once per sample and mix. */
+				for (int i = 0; i < n; ++i) {
+					float mixed = bv + tv +
+						(float)ay8912_calc(ay) * ay_volume / AY8912_MAX_OUTPUT;
+					if (mixed >  1.0f) mixed =  1.0f;
+					if (mixed < -1.0f) mixed = -1.0f;
+					buf[i] = (int16_t)(mixed * 32767.0f);
+				}
+			} else {
+				float mixed = bv + tv;
+				if (mixed >  1.0f) mixed =  1.0f;
+				if (mixed < -1.0f) mixed = -1.0f;
+				int16_t val = (int16_t)(mixed * 32767.0f);
+				for (int i = 0; i < n; ++i) buf[i] = val;
+			}
+			SDL_QueueAudio(audio_dev, buf, n * (int)sizeof(int16_t));
+			nsamp -= n;
+		}
+	}
 }
 
 static inline void beeper_begin_slice(void)
