@@ -15,7 +15,7 @@ all: $(BINS)
 SDL2_BINS = rc2014_sdl2 nc100 nc200 n8_sdl2 scelbi_sdl2 nascom uk101 \
 	z180-mini-itx_sdl2 vz300 2063_sdl2 rcbus-8070_sdl2 rcbus-8085_sdl2 max80 \
 	sorceror z80all osi400 osi500 spectrum microtan 6502retro \
-	poly88
+	poly88 phoenix
 
 sdl2: $(SDL2_BINS)
 
@@ -227,6 +227,12 @@ s100-8080: s100-8080.o intel_8080_emulator.o mits1.o ide.o tarbell_fdc.o wd17xx.
 
 poly88: poly88.o intel_8080_emulator.o event_sdl2.o i8251.o ide.o ttycon.o asciikbd_sdl2.o tarbell_fdc.o wd17xx.o
 	cc -g3 poly88.o intel_8080_emulator.o event_sdl2.o i8251.o ide.o ttycon.o asciikbd_sdl2.o tarbell_fdc.o wd17xx.o -o poly88 -lSDL2
+
+phoenix: src/phoenix/phoenix.o intel_8080_emulator.o
+	cc -g3 src/phoenix/phoenix.o intel_8080_emulator.o -o phoenix -lSDL2
+
+src/phoenix/phoenix.o: src/phoenix/phoenix.c src/phoenix/phoenix.h
+	$(CC) $(CFLAGS) -I. -c src/phoenix/phoenix.c -o src/phoenix/phoenix.o
 
 mini11: mini11.o 68hc11.o sdcard.o 6522.o
 	cc -g3 mini11.o sdcard.o 6522.o 68hc11.o -o mini11
