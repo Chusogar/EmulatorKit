@@ -474,6 +474,16 @@ static inline const uint8_t* cur_payload(const tzx_player_t* tp, uint32_t* out_p
 /* Forward declaration needed by proc functions defined before tzx_next_block */
 static void tzx_next_block(tzx_player_t* tp);
 
+/* Finaliza el stream de datos: programa pausa si aplica y avanza al siguiente bloque. */
+static inline void tzx_finish_data_stream(tzx_player_t* tp)
+{
+    if (tp->p_pause_ms){
+        tp->pause_end_at = tp->next_edge_at + ms_to_tstates(tp->p_pause_ms);
+        tp->next_edge_at = 0;
+    }
+    tzx_next_block(tp);
+}
+
 /* -------- 0x10 / 0x11 Standard / Turbo -------- */
 static void tzx_init_std_or_turbo(tzx_player_t* tp, int turbo)
 {
@@ -535,6 +545,7 @@ static void tzx_proc_std_or_turbo(tzx_player_t* tp, uint64_t t_now)
         TZX_EAR_TOGGLE(tp, tp->next_edge_at);
         /* entra a bits */
         tp->pilot_left = -3;
+        if (tp->i_byte >= tp->sub_len){ tzx_finish_data_stream(tp); return; }
         uint32_t plen; const uint8_t* p = cur_payload(tp,&plen);
         uint8_t b = p[tp->sub_ofs + tp->i_byte];
         int bit = (b & tp->bit_mask)?1:0;
@@ -545,6 +556,7 @@ static void tzx_proc_std_or_turbo(tzx_player_t* tp, uint64_t t_now)
     if (t_now < tp->next_edge_at) return;
     TZX_EAR_TOGGLE(tp, tp->next_edge_at);
     uint32_t plen; const uint8_t* p = cur_payload(tp,&plen);
+    if (tp->i_byte >= tp->sub_len){ tzx_finish_data_stream(tp); return; }
     uint8_t b = p[tp->sub_ofs + tp->i_byte];
     int bit = (b & tp->bit_mask)?1:0;
     int tlen = bit?tp->p_1:tp->p_0;
@@ -561,28 +573,10 @@ static void tzx_proc_std_or_turbo(tzx_player_t* tp, uint64_t t_now)
         if ((tp->blk[tp->i_blk].id==0x11 || tp->blk[tp->i_blk].id==0x14) &&
             tp->i_byte == tp->sub_len-1 && tp->p_used_bits>=1 && tp->p_used_bits<=8){
             /* si máscara cae fuera de bits usados, terminamos */
-            if (tp->bit_mask < (1u<<(8 - tp->p_used_bits))){
-                if (tp->p_pause_ms){
-                    tp->pause_end_at = tp->next_edge_at + ms_to_tstates(tp->p_pause_ms);
-                    tp->next_edge_at = 0;
-                    tzx_next_block(tp);  /* avanzar ya al siguiente bloque */
-                } else {
-                    tzx_next_block(tp);
-                }
-                return;
-            }
+            if (tp->bit_mask < (1u<<(8 - tp->p_used_bits))){ tzx_finish_data_stream(tp); return; }
         }
 
-        if (tp->i_byte >= tp->sub_len){
-            if (tp->p_pause_ms){
-                tp->pause_end_at = tp->next_edge_at + ms_to_tstates(tp->p_pause_ms);
-                tp->next_edge_at = 0;
-                tzx_next_block(tp);  /* avanzar ya al siguiente bloque */
-            } else {
-                tzx_next_block(tp);
-            }
-            return;
-        }
+        if (tp->i_byte >= tp->sub_len){ tzx_finish_data_stream(tp); return; }
         b = p[tp->sub_ofs + tp->i_byte];
         bit = (b & tp->bit_mask)?1:0;
         tlen = bit?tp->p_1:tp->p_0;
