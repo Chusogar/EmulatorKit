@@ -15,7 +15,7 @@ all: $(BINS)
 SDL2_BINS = rc2014_sdl2 nc100 nc200 n8_sdl2 scelbi_sdl2 nascom uk101 \
 	z180-mini-itx_sdl2 vz300 2063_sdl2 rcbus-8070_sdl2 rcbus-8085_sdl2 max80 \
 	sorceror z80all osi400 osi500 spectrum microtan 6502retro \
-	poly88
+	poly88 coleco_sdl2
 
 sdl2: $(SDL2_BINS)
 
@@ -338,6 +338,30 @@ osi400: osi400.o acia.o ttycon.o 6502.o 6502dis.o
 
 osi500: osi500.o acia.o ttycon.o 6502.o 6821.o 6502dis.o
 	cc -g3 osi500.o acia.o ttycon.o 6502.o 6821.o 6502dis.o -lSDL2 -o osi500
+
+src/coleco/coleco.o: src/coleco/coleco.c
+	cc $(CFLAGS) -c src/coleco/coleco.c -o src/coleco/coleco.o
+
+src/coleco/coleco_mem.o: src/coleco/coleco_mem.c
+	cc $(CFLAGS) -c src/coleco/coleco_mem.c -o src/coleco/coleco_mem.o
+
+src/coleco/coleco_vdp.o: src/coleco/coleco_vdp.c
+	cc $(CFLAGS) -c src/coleco/coleco_vdp.c -o src/coleco/coleco_vdp.o
+
+src/coleco/coleco_psg.o: src/coleco/coleco_psg.c
+	cc $(CFLAGS) -c src/coleco/coleco_psg.c -o src/coleco/coleco_psg.o
+
+src/coleco/coleco_io.o: src/coleco/coleco_io.c
+	cc $(CFLAGS) -c src/coleco/coleco_io.c -o src/coleco/coleco_io.o
+
+coleco_sdl2: src/coleco/coleco.o src/coleco/coleco_mem.o src/coleco/coleco_vdp.o \
+	src/coleco/coleco_psg.o src/coleco/coleco_io.o \
+	event_sdl2.o tms9918a.o tms9918a_sdl2.o sn76489_sdl.o emu76489.o \
+	z80dis.o libz80/libz80.o
+	cc -g3 src/coleco/coleco.o src/coleco/coleco_mem.o src/coleco/coleco_vdp.o \
+	src/coleco/coleco_psg.o src/coleco/coleco_io.o \
+	event_sdl2.o tms9918a.o tms9918a_sdl2.o sn76489_sdl.o emu76489.o \
+	z80dis.o libz80/libz80.o -lm -lSDL2 -o coleco_sdl2
 
 makedisk: makedisk.o ide.o
 	cc -O2 -o makedisk makedisk.o ide.o
