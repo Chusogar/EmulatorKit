@@ -58,6 +58,7 @@ ROM set (parent `pengo`): `ep1689c.8`, `ep1690b.7`, `ep1691b.15`, `ep1692b.14`,
 
 ## Contents of this package
 
+- `pengo-driver.bundle` — preferred: fetchable git commit for dsp-cpp
 - `0001-Add-Pengo-arcade-driver.patch` — single commit patch against dsp-cpp `main`
 - Full copies of every new/modified file for review without applying the patch
-- Updated `CMakeLists.txt`, `README.md` and `tests/tests.cpp`
+- Updated `CMakeLists.txt`, `README.dsp-cpp.md` (project README) and `tests/tests.cpp`
