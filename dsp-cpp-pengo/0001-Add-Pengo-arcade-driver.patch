@@ -1,0 +1,1335 @@
+From 4caef5f67aa430259216c8a40dbc82b136c7bb5a Mon Sep 17 00:00:00 2001
+From: Cursor Agent <cursoragent@cursor.com>
+Date: Tue, 4 Aug 2026 08:00:11 +0000
+Subject: [PATCH] Add Pengo arcade driver ported from dsp-emulator
+
+Port pengo_hw.pas into dsp-cpp with the supporting Namco WSG sound chip
+and Sega Z80 opcode/data decryptor. The Z80 core now exposes an
+opcode_fetch() flag so encrypted ROMs can serve different bytes for M1
+fetches and data reads, matching nz80.pas.
+---
+ CMakeLists.txt               |   5 +
+ README.md                    |  20 +-
+ src/cpu/z80.cpp              |   8 +
+ src/cpu/z80.h                |   6 +
+ src/drivers/pengo.cpp        | 352 +++++++++++++++++++++++++++++++++++
+ src/drivers/pengo.h          |  86 +++++++++
+ src/machine/sega_decrypt.cpp | 339 +++++++++++++++++++++++++++++++++
+ src/machine/sega_decrypt.h   |  14 ++
+ src/main.cpp                 |  12 +-
+ src/sound/namco_snd.cpp      | 104 +++++++++++
+ src/sound/namco_snd.h        |  53 ++++++
+ tests/tests.cpp              |  74 ++++++++
+ 12 files changed, 1064 insertions(+), 9 deletions(-)
+ create mode 100644 src/drivers/pengo.cpp
+ create mode 100644 src/drivers/pengo.h
+ create mode 100644 src/machine/sega_decrypt.cpp
+ create mode 100644 src/machine/sega_decrypt.h
+ create mode 100644 src/sound/namco_snd.cpp
+ create mode 100644 src/sound/namco_snd.h
+
+diff --git a/CMakeLists.txt b/CMakeLists.txt
+index cbbb18b..507b2ba 100644
+--- a/CMakeLists.txt
++++ b/CMakeLists.txt
+@@ -25,14 +25,17 @@ add_executable(dsp
+   src/sound/pokey.cpp
+   src/sound/msm5205.cpp
+   src/sound/okim6295.cpp
++  src/sound/namco_snd.cpp
+   src/video/gfx.cpp
+   src/video/atari_mo.cpp
+   src/machine/bagman_pal.cpp
+   src/machine/slapstic.cpp
++  src/machine/sega_decrypt.cpp
+   src/drivers/bagman.cpp
+   src/drivers/mikie.cpp
+   src/drivers/gauntlet.cpp
+   src/drivers/doubledragon.cpp
++  src/drivers/pengo.cpp
+   src/core/rom_loader.cpp
+   src/frontend/sdl_app.cpp
+ )
+@@ -55,10 +58,12 @@ add_executable(dsp_tests
+   src/sound/pokey.cpp
+   src/sound/msm5205.cpp
+   src/sound/okim6295.cpp
++  src/sound/namco_snd.cpp
+   src/video/gfx.cpp
+   src/video/atari_mo.cpp
+   src/machine/bagman_pal.cpp
+   src/machine/slapstic.cpp
++  src/machine/sega_decrypt.cpp
+ )
+ target_include_directories(dsp_tests PRIVATE src)
+ target_compile_options(dsp_tests PRIVATE -Wall -Wextra)
+diff --git a/README.md b/README.md
+index 42e5fe0..c24d1a3 100644
+--- a/README.md
++++ b/README.md
+@@ -2,7 +2,8 @@
+ 
+ C++17 + SDL2 port of [dsp-emulator](https://github.com/leniad/dsp-emulator) (Free Pascal).
+ Supported games: **Bagman** (Valadon Automation, 1982), **Mikie** (Konami, 1984),
+-**Gauntlet** (Atari, 1985), **Double Dragon** and **Double Dragon II** (Technos, 1987/1988).
++**Gauntlet** (Atari, 1985), **Double Dragon** and **Double Dragon II** (Technos, 1987/1988),
++**Pengo** (Sega, 1982).
+ 
+ ## What is ported
+ 
+@@ -26,6 +27,9 @@ Supported games: **Bagman** (Valadon Automation, 1982), **Mikie** (Konami, 1984)
+ | MSM5205 ADPCM | `src/snd/msm5205.pas` | Two chips in Double Dragon |
+ | OKI MSM6295 | `src/snd/oki6295.pas` | Double Dragon II sample player |
+ | Double Dragon driver | `src/arcade/doubledragon_hw.pas` | Both variants: banked ROM, shared RAM, scroll, sprites, sound CPUs |
++| Namco WSG | `src/snd/namco_snd.pas` | 3-voice PROM waveform chip used by Pengo |
++| Sega Z80 decrypt | `src/arcade/misc/sega_decrypt.pas` | Opcode/data tables; Pengo uses table 2 |
++| Pengo driver | `src/arcade/pengo_hw.pas` | Encrypted Z80, Pac-Man style video, Namco sound, DIPs |
+ | Front end | `src/misc/main_engine.pas` | SDL2 window, texture, audio queue, keyboard |
+ 
+ ## Building
+@@ -52,10 +56,11 @@ holding the individual files:
+ ./build/dsp --game gauntlet /path/to/gauntlet.zip
+ ./build/dsp --game ddragon /path/to/ddragon.zip
+ ./build/dsp --game ddragon2 /path/to/ddragon2.zip
++./build/dsp --game pengo /path/to/pengo.zip
+ ```
+ 
+-The game is taken from `--game` (`bagman`, `mikie`, `gauntlet`, `ddragon` or
+-`ddragon2`); when omitted it is guessed from the ROM set name. Gauntlet accepts both the four player parent set
++The game is taken from `--game` (`bagman`, `mikie`, `gauntlet`, `ddragon`,
++`ddragon2` or `pengo`); when omitted it is guessed from the ROM set name. Gauntlet accepts both the four player parent set
+ (SLAPSTIC 104) and the two player `136041-xxx` set (SLAPSTIC 107).
+ 
+ Required files: `e9_b05.bin`, `f9_b06.bin`, `f9_b07.bin`, `k9_b08.bin`, `m9_b09s.bin`,
+@@ -64,12 +69,13 @@ Required files: `e9_b05.bin`, `f9_b06.bin`, `f9_b07.bin`, `k9_b08.bin`, `m9_b09s
+ Options:
+ 
+ ```
+---game NAME        game to run: bagman, mikie, gauntlet, ddragon or ddragon2
++--game NAME        game to run: bagman, mikie, gauntlet, ddragon, ddragon2 or pengo
+ --scale N          window scale factor (default 3)
+ --dip [BANK:]VALUE DIP switch byte, decimal or 0x hex (bagman: one bank,
+                    mikie: 0=A coinage, 1=B gameplay, 2=C flip screen;
+                    gauntlet: service switch;
+-                   double dragon: 0=A coinage/cabinet, 1=B gameplay)
++                   double dragon: 0=A coinage/cabinet, 1=B gameplay;
++                   pengo: 0=A gameplay, 1=B coinage)
+ --mute             disable audio
+ --fullscreen       start in full screen
+ --screenshot FILE  headless mode: render frames and write FILE (BMP)
+@@ -112,6 +118,10 @@ and bank C holds flip screen (bit 0) and upright controls (bit 1).
+ Mikie ROM set: `n14.11c`, `o13.12a`, `o17.12d`, `n10.6e`, `o11.8i`, `001.f1`, `003.f3`,
+ `005.h1`, `007.h3`, `d19.1i`, `d21.3i`, `d20.2i`, `d22.12h`, `d18.f9`.
+ 
++Pengo defaults are `--dip 0:0xb0 --dip 1:0xcc`. ROM set: `ep1689c.8`, `ep1690b.7`,
++`ep1691b.15`, `ep1692b.14`, `ep1693b.21`, `ep1694b.20`, `ep5118b.32`, `ep5119c.31`,
++`ep1640.92`, `ep1695.105`, `pr1633.78`, `pr1634.88`, `pr1635.51`.
++
+ ## Tests
+ 
+ ```bash
+diff --git a/src/cpu/z80.cpp b/src/cpu/z80.cpp
+index 92889c1..f45f363 100644
+--- a/src/cpu/z80.cpp
++++ b/src/cpu/z80.cpp
+@@ -525,7 +525,9 @@ int Z80::run(int cycles) {
+             continue;
+         }
+ 
++        opcode_fetch_ = true;
+         uint8_t opcode = fetch();
++        opcode_fetch_ = false;
+         r = uint8_t(((r + 1) & 0x7f) | (r & 0x80));
+         cycles_ += kMain[opcode];
+ 
+@@ -875,7 +877,9 @@ int Z80::run(int cycles) {
+ }
+ 
+ void Z80::exec_cb() {
++    opcode_fetch_ = true;
+     uint8_t opcode = fetch();
++    opcode_fetch_ = false;
+     r = uint8_t(((r + 1) & 0x7f) | (r & 0x80));
+     cycles_ += kCb[opcode];
+ 
+@@ -917,7 +921,9 @@ void Z80::exec_cb() {
+ }
+ 
+ void Z80::exec_ed() {
++    opcode_fetch_ = true;
+     uint8_t opcode = fetch();
++    opcode_fetch_ = false;
+     r = uint8_t(((r + 1) & 0x7f) | (r & 0x80));
+     cycles_ += kEd[opcode];
+ 
+@@ -1040,7 +1046,9 @@ void Z80::exec_ed() {
+ }
+ 
+ void Z80::exec_index(uint16_t* index_reg) {
++    opcode_fetch_ = true;
+     uint8_t opcode = fetch();
++    opcode_fetch_ = false;
+     r = uint8_t(((r + 1) & 0x7f) | (r & 0x80));
+     cycles_ += kIndex[opcode];
+ 
+diff --git a/src/cpu/z80.h b/src/cpu/z80.h
+index 9166a55..169339e 100644
+--- a/src/cpu/z80.h
++++ b/src/cpu/z80.h
+@@ -34,6 +34,11 @@ public:
+     uint16_t pc() const { return pc_; }
+     void set_pc(uint16_t value) { pc_ = value; }
+ 
++    // True while the core is fetching an opcode/prefix byte (M1), mirroring
++    // nz80.pas `opcode`. Encrypted games such as Pengo use this to pick the
++    // opcode ROM bank versus the data ROM bank.
++    bool opcode_fetch() const { return opcode_fetch_; }
++
+     // Registers, public to keep debugging and driver hooks simple.
+     uint8_t a = 0, f = 0, b = 0, c = 0, d = 0, e = 0, h = 0, l = 0;
+     uint8_t a2 = 0, f2 = 0, b2 = 0, c2 = 0, d2 = 0, e2 = 0, h2 = 0, l2 = 0;
+@@ -118,6 +123,7 @@ private:
+     int cycles_ = 0;      // T states consumed by the instruction being executed
+     int executed_ = 0;    // T states consumed in the current run() call
+     bool after_ei_ = false;
++    bool opcode_fetch_ = false;
+     IrqLine irq_state_ = IrqLine::Clear;
+     IrqLine nmi_state_ = IrqLine::Clear;
+     // A level asserted NMI is edge triggered: it fires once and stays latched
+diff --git a/src/drivers/pengo.cpp b/src/drivers/pengo.cpp
+new file mode 100644
+index 0000000..db0c04f
+--- /dev/null
++++ b/src/drivers/pengo.cpp
+@@ -0,0 +1,352 @@
++#include "drivers/pengo.h"
++
++#include <algorithm>
++#include <cstring>
++
++#include "core/rom_loader.h"
++#include "machine/sega_decrypt.h"
++
++namespace dsp {
++namespace {
++
++const std::vector<RomEntry> kMainRoms = {
++    {"ep1689c.8|ep1689.8", 0x1000, 0x0000, 0xf37066a8},
++    {"ep1690b.7|ep1690.7", 0x1000, 0x1000, 0xbaf48143},
++    {"ep1691b.15|ep1691.15", 0x1000, 0x2000, 0xadf0eba0},
++    {"ep1692b.14|ep1692.14", 0x1000, 0x3000, 0xa086d60f},
++    {"ep1693b.21|ep1693.21", 0x1000, 0x4000, 0xb72084ec},
++    {"ep1694b.20|ep1694.20", 0x1000, 0x5000, 0x94194a89},
++    {"ep5118b.32|ep5118.32", 0x1000, 0x6000, 0xaf7b12c4},
++    {"ep5119c.31|ep5119.31", 0x1000, 0x7000, 0x933950fe},
++};
++
++const std::vector<RomEntry> kPaletteRoms = {
++    {"pr1633.78", 0x20, 0x00, 0x3a5844ec},
++    {"pr1634.88", 0x400, 0x20, 0x766b139b},
++};
++
++const std::vector<RomEntry> kSoundRoms = {
++    {"pr1635.51", 0x100, 0x00, 0xc29dea27},
++};
++
++const std::vector<RomEntry> kGfxRoms = {
++    {"ep1640.92|ep1640.92.bin", 0x2000, 0x0000, 0xd7eec6cd},
++    {"ep1695.105|ep1695.105.bin", 0x2000, 0x4000, 0x5bfd26e9},
++};
++
++GfxLayout char_layout() {
++    GfxLayout layout;
++    layout.width = 8;
++    layout.height = 8;
++    layout.total = 0x200;
++    layout.planes = 2;
++    layout.char_increment = 16 * 8;
++    layout.rotate_cw = true;
++    layout.plane_offsets = {0, 4};
++    layout.x_offsets = {8 * 8 + 0, 8 * 8 + 1, 8 * 8 + 2, 8 * 8 + 3, 0, 1, 2, 3};
++    layout.y_offsets = {0 * 8, 1 * 8, 2 * 8, 3 * 8, 4 * 8, 5 * 8, 6 * 8, 7 * 8};
++    return layout;
++}
++
++GfxLayout sprite_layout() {
++    GfxLayout layout;
++    layout.width = 16;
++    layout.height = 16;
++    layout.total = 0x80;
++    layout.planes = 2;
++    layout.char_increment = 64 * 8;
++    layout.rotate_cw = true;
++    layout.plane_offsets = {0, 4};
++    layout.x_offsets = {8 * 8,     8 * 8 + 1, 8 * 8 + 2,  8 * 8 + 3,  16 * 8 + 0, 16 * 8 + 1,
++                        16 * 8 + 2, 16 * 8 + 3, 24 * 8 + 0, 24 * 8 + 1, 24 * 8 + 2, 24 * 8 + 3,
++                        0,          1,          2,          3};
++    layout.y_offsets = {0 * 8,  1 * 8,  2 * 8,  3 * 8,  4 * 8,  5 * 8,  6 * 8,  7 * 8,
++                        32 * 8, 33 * 8, 34 * 8, 35 * 8, 36 * 8, 37 * 8, 38 * 8, 39 * 8};
++    return layout;
++}
++
++// Classic Pac-Man / Pengo video RAM offset for a tile at (x, y) in the 28x36 map.
++int tile_offset(int tile_x, int tile_y) {
++    int sx = 29 - tile_x;
++    int sy = tile_y - 2;
++    if (sy & 0x20) return sx + ((sy & 0x1f) << 5);
++    return sy + (sx << 5);
++}
++
++}  // namespace
++
++Pengo::Pengo() : cpu_(kCpuClock), namco_(3) {
++    framebuffer_.assign(size_t(kScreenWidth) * kScreenHeight, 0xff000000u);
++
++    cpu_.set_memory_handlers([this](uint16_t address) { return read_byte(address); },
++                             [this](uint16_t address, uint8_t value) { write_byte(address, value); });
++    cpu_.set_cycle_handler([this](int cycles) { on_cycles(cycles); });
++}
++
++bool Pengo::init(const std::string& rom_path, std::string* error) {
++    RomLoader loader;
++    if (!loader.open(rom_path, error)) return false;
++
++    std::vector<uint8_t> main_rom(0x8000, 0);
++    if (!loader.load(kMainRoms, main_rom, error)) return false;
++    std::copy(main_rom.begin(), main_rom.end(), memory_.begin());
++    decrypt_sega(memory_.data(), opcodes_.data(), 2, 0x8000);
++
++    std::vector<uint8_t> gfx_rom(0x6000, 0);
++    if (!loader.load(kGfxRoms, gfx_rom, error)) return false;
++
++    std::vector<uint8_t> prom(0x420, 0);
++    if (!loader.load(kPaletteRoms, prom, error)) return false;
++
++    std::vector<uint8_t> wave(0x100, 0);
++    if (!loader.load(kSoundRoms, wave, error)) return false;
++    namco_.set_wave_prom(wave);
++
++    decode_graphics(std::move(gfx_rom));
++    build_palette(prom);
++    warnings_ = loader.warnings();
++
++    reset();
++    return true;
++}
++
++void Pengo::decode_graphics(std::vector<uint8_t> sprite_rom) {
++    // Reorder the two 8K gfx ROMs the same way pengo_hw.pas does before convert_gfx.
++    if (sprite_rom.size() < 0x6000) sprite_rom.resize(0x6000, 0);
++    std::memcpy(sprite_rom.data() + 0x2000, sprite_rom.data() + 0x1000, 0x1000);
++    std::memcpy(sprite_rom.data() + 0x1000, sprite_rom.data() + 0x4000, 0x1000);
++    std::memcpy(sprite_rom.data() + 0x3000, sprite_rom.data() + 0x5000, 0x1000);
++
++    chars_.decode(char_layout(), sprite_rom);
++    std::vector<uint8_t> sprite_region(sprite_rom.begin() + 0x2000, sprite_rom.begin() + 0x4000);
++    sprites_.decode(sprite_layout(), sprite_region);
++}
++
++void Pengo::build_palette(const std::vector<uint8_t>& prom) {
++    const std::vector<int> resistances = {1000, 470, 220};
++    auto weights = compute_resistor_weights(0, 255, -1.0,
++                                            {{resistances, 0, 0},
++                                             {resistances, 0, 0},
++                                             {{470, 220}, 0, 0}});
++
++    palette_.fill(0xff000000u);
++    for (size_t index = 0; index < 0x20; index++) {
++        uint8_t data = prom[index];
++        int red = combine_weights(weights[0], {(data >> 0) & 1, (data >> 1) & 1, (data >> 2) & 1});
++        int green = combine_weights(weights[1], {(data >> 3) & 1, (data >> 4) & 1, (data >> 5) & 1});
++        int blue = combine_weights(weights[2], {(data >> 6) & 1, (data >> 7) & 1});
++        palette_[index] = 0xff000000u | (uint32_t(red) << 16) | (uint32_t(green) << 8) | uint32_t(blue);
++    }
++
++    // Colour lookup PROM: bank 0 uses pens 0-15, bank 1 uses pens 16-31.
++    color_lut_.fill(0);
++    for (size_t index = 0; index < 256; index++) {
++        uint8_t entry = uint8_t(prom[0x20 + index] & 0x0f);
++        color_lut_[index] = entry;
++        color_lut_[index + 0x100] = uint8_t(entry + 0x10);
++    }
++}
++
++void Pengo::reset() {
++    cpu_.reset();
++    namco_.reset();
++    irq_enable_ = false;
++    flip_screen_ = false;
++    gfx_bank_ = 0;
++    pal_bank_ = 0;
++    colortable_bank_ = 0;
++    in0_ = 0xff;
++    in1_ = 0xff;
++    dirty_.fill(true);
++    tilemap_.fill(0xff000000u);
++    composite_.fill(0xff000000u);
++    audio_accumulator_ = 0;
++    audio_.clear();
++}
++
++uint8_t Pengo::read_byte(uint16_t address) {
++    if (address <= 0x7fff) {
++        return cpu_.opcode_fetch() ? opcodes_[address] : memory_[address];
++    }
++    if (address >= 0x8000 && address <= 0x8fff) return memory_[address];
++    if (address >= 0x9000 && address <= 0x903f) return dsw_b_;
++    if (address >= 0x9040 && address <= 0x907f) return dsw_a_;
++    if (address >= 0x9080 && address <= 0x90bf) return in1_;
++    if (address >= 0x90c0 && address <= 0x90ff) return in0_;
++    return 0xff;
++}
++
++void Pengo::write_byte(uint16_t address, uint8_t value) {
++    if (address <= 0x7fff) return;  // ROM
++
++    if (address >= 0x8000 && address <= 0x87ff) {
++        if (memory_[address] != value) {
++            dirty_[address & 0x3ff] = true;
++            memory_[address] = value;
++        }
++        return;
++    }
++    if ((address >= 0x8800 && address <= 0x8fff) || (address >= 0x9020 && address <= 0x902f)) {
++        memory_[address] = value;
++        return;
++    }
++    if (address >= 0x9000 && address <= 0x901f) {
++        namco_.write_reg(int(address & 0x1f), value);
++        return;
++    }
++
++    switch (address) {
++        case 0x9040:
++            irq_enable_ = value != 0;
++            if (!irq_enable_) cpu_.set_irq(IrqLine::Clear);
++            break;
++        case 0x9041:
++            namco_.set_enabled(value != 0);
++            break;
++        case 0x9042:
++            if (pal_bank_ != (value & 1)) {
++                pal_bank_ = uint8_t(value & 1);
++                dirty_.fill(true);
++            }
++            break;
++        case 0x9043:
++            flip_screen_ = (value & 1) != 0;
++            break;
++        case 0x9046:
++            if (colortable_bank_ != (value & 1)) {
++                colortable_bank_ = uint8_t(value & 1);
++                dirty_.fill(true);
++            }
++            break;
++        case 0x9047:
++            if (gfx_bank_ != (value & 1)) {
++                gfx_bank_ = uint8_t(value & 1);
++                dirty_.fill(true);
++            }
++            break;
++        case 0x9070:
++            break;  // watchdog
++        default:
++            break;
++    }
++}
++
++void Pengo::on_cycles(int cycles) {
++    audio_accumulator_ += int64_t(cycles) * NamcoSnd::kSampleRate;
++    while (audio_accumulator_ >= kCpuClock) {
++        audio_accumulator_ -= kCpuClock;
++        int32_t sample = namco_.update();
++        audio_.push_back(int16_t(std::clamp(sample, -32768, 32767)));
++    }
++}
++
++void Pengo::draw_tile(int offset) {
++    // `offset` is packed as ((tile_x & 0xff) << 8) | (tile_y & 0xff) by update_video().
++    const int tile_x = (offset >> 8) & 0xff;
++    const int tile_y = offset & 0xff;
++    const int ram_offset = tile_offset(tile_x, tile_y);
++
++    const int color_base =
++        (((memory_[0x8400 + ram_offset] & 0x1f) | (colortable_bank_ << 5) | (pal_bank_ << 6)) << 2);
++    const int code = memory_[0x8000 + ram_offset] + (gfx_bank_ << 8);
++    const uint8_t* pixels = chars_.element(code);
++
++    for (int y = 0; y < 8; y++) {
++        uint32_t* target = &tilemap_[size_t((tile_y * 8 + y) * kScreenWidth + tile_x * 8)];
++        for (int x = 0; x < 8; x++) {
++            uint8_t pen = color_lut_[size_t(pixels[y * 8 + x] + color_base)];
++            target[x] = palette_[pen];
++        }
++    }
++}
++
++void Pengo::draw_sprite(int index) {
++    const uint8_t attrib = memory_[0x8ff0 + index * 2];
++    const int code = (attrib >> 2) | (gfx_bank_ << 6);
++    const int color_base =
++        (((memory_[0x8ff1 + index * 2] & 0x1f) | (colortable_bank_ << 5) | (pal_bank_ << 6)) << 2);
++    const int pos_x = (240 - memory_[0x9020 + index * 2] - 1) & 0xff;
++    const int pos_y = 272 - memory_[0x9021 + index * 2];
++    const bool flip_x = (attrib & 2) != 0;
++    const bool flip_y = (attrib & 1) != 0;
++
++    const uint8_t* pixels = sprites_.element(code);
++    for (int y = 0; y < 16; y++) {
++        const int screen_y = pos_y + y;
++        if (screen_y < 0 || screen_y >= kScreenHeight) continue;
++        const int source_y = flip_y ? (15 - y) : y;
++        for (int x = 0; x < 16; x++) {
++            const int source_x = flip_x ? (15 - x) : x;
++            const uint8_t raw = pixels[source_y * 16 + source_x];
++            const uint8_t pen = color_lut_[size_t(raw + color_base)];
++            // put_gfx_sprite_mask(..., trans=0, mask=0xf): skip when low nibble is 0.
++            if ((pen & 0x0f) == 0) continue;
++            const int screen_x = (pos_x + x) & 0xff;
++            if (screen_x >= kScreenWidth) continue;
++            composite_[size_t(screen_y * kScreenWidth + screen_x)] = palette_[pen];
++        }
++    }
++}
++
++void Pengo::update_video() {
++    for (int tile_x = 0; tile_x < 28; tile_x++) {
++        for (int tile_y = 0; tile_y < 36; tile_y++) {
++            const int ram_offset = tile_offset(tile_x, tile_y);
++            if (!dirty_[size_t(ram_offset)]) continue;
++            draw_tile((tile_x << 8) | tile_y);
++            dirty_[size_t(ram_offset)] = false;
++        }
++    }
++
++    composite_ = tilemap_;
++    for (int index = 7; index >= 0; index--) draw_sprite(index);
++
++    for (int y = 0; y < kScreenHeight; y++) {
++        for (int x = 0; x < kScreenWidth; x++) {
++            uint32_t pixel = composite_[size_t(y * kScreenWidth + x)];
++            size_t target = flip_screen_ ? size_t((kScreenHeight - 1 - y) * kScreenWidth +
++                                                 (kScreenWidth - 1 - x))
++                                        : size_t(y * kScreenWidth + x);
++            framebuffer_[target] = pixel;
++        }
++    }
++}
++
++void Pengo::run_frame() {
++    const int cycles_per_line = int(kCpuClock / kFramesPerSecond / kScanlines);
++    for (int line = 0; line < kScanlines; line++) {
++        if (line == 224) {
++            update_video();
++            if (irq_enable_) cpu_.set_irq(IrqLine::Hold);
++        }
++        cpu_.run(cycles_per_line);
++    }
++}
++
++void Pengo::set_inputs(const MachineInputs& inputs) {
++    const InputState& player1 = inputs.player1;
++    in0_ = 0xff;
++    in1_ = 0xff;
++    if (player1.up) in0_ &= 0xfe;
++    if (player1.down) in0_ &= 0xfd;
++    if (player1.left) in0_ &= 0xfb;
++    if (player1.right) in0_ &= 0xf7;
++    if (inputs.coin1) in0_ &= 0xef;
++    if (inputs.coin2) in0_ &= 0xdf;
++    if (player1.button1) in0_ &= 0x7f;
++
++    if (player1.start) in1_ &= 0xdf;
++    if (inputs.player2.start) in1_ &= 0xbf;
++}
++
++void Pengo::set_dip_switch(int bank, uint8_t value) {
++    if (bank == 0) dsw_a_ = value;
++    if (bank == 1) dsw_b_ = value;
++}
++
++void Pengo::drain_audio(std::vector<int16_t>& out) {
++    out.insert(out.end(), audio_.begin(), audio_.end());
++    audio_.clear();
++}
++
++}  // namespace dsp
+diff --git a/src/drivers/pengo.h b/src/drivers/pengo.h
+new file mode 100644
+index 0000000..b8f01ae
+--- /dev/null
++++ b/src/drivers/pengo.h
+@@ -0,0 +1,86 @@
++#pragma once
++
++#include <array>
++#include <cstdint>
++#include <string>
++#include <vector>
++
++#include "core/machine.h"
++#include "cpu/z80.h"
++#include "sound/namco_snd.h"
++#include "video/gfx.h"
++
++namespace dsp {
++
++// Pengo (Sega, 1982), ported from pengo_hw.pas.
++class Pengo : public Machine {
++public:
++    static constexpr int kScreenWidth = 224;
++    static constexpr int kScreenHeight = 288;
++    static constexpr double kFramesPerSecond = 18432000.0 / 3.0 / 384.0 / 264.0;
++    static constexpr int kScanlines = 264;
++    static constexpr uint32_t kCpuClock = 18432000 / 6;
++
++    Pengo();
++
++    bool init(const std::string& rom_path, std::string* error) override;
++    void reset() override;
++    void run_frame() override;
++
++    void set_inputs(const MachineInputs& inputs) override;
++    void set_dip_switch(int bank, uint8_t value) override;
++
++    const uint32_t* framebuffer() const override { return framebuffer_.data(); }
++    int screen_width() const override { return kScreenWidth; }
++    int screen_height() const override { return kScreenHeight; }
++    double frames_per_second() const override { return kFramesPerSecond; }
++
++    void drain_audio(std::vector<int16_t>& out) override;
++    int sample_rate() const override { return NamcoSnd::kSampleRate; }
++
++    const char* title() const override { return "Pengo"; }
++
++private:
++    uint8_t read_byte(uint16_t address);
++    void write_byte(uint16_t address, uint8_t value);
++    void on_cycles(int cycles);
++
++    void decode_graphics(std::vector<uint8_t> sprite_rom);
++    void build_palette(const std::vector<uint8_t>& prom);
++    void update_video();
++    void draw_tile(int offset);
++    void draw_sprite(int index);
++
++    Z80 cpu_;
++    NamcoSnd namco_;
++
++    std::array<uint8_t, 0x10000> memory_{};
++    std::array<uint8_t, 0x8000> opcodes_{};
++    std::array<bool, 0x400> dirty_{};
++    std::array<uint32_t, 32> palette_{};
++    std::array<uint8_t, 0x200> color_lut_{};
++
++    GfxSet chars_;
++    GfxSet sprites_;
++
++    // Work surfaces match the 224x288 Pengo bitmap used in pengo_hw.pas.
++    std::array<uint32_t, kScreenWidth * kScreenHeight> tilemap_{};
++    std::array<uint32_t, kScreenWidth * kScreenHeight> composite_{};
++    std::vector<uint32_t> framebuffer_;
++
++    bool irq_enable_ = false;
++    bool flip_screen_ = false;
++    uint8_t gfx_bank_ = 0;
++    uint8_t pal_bank_ = 0;
++    uint8_t colortable_bank_ = 0;
++
++    uint8_t in0_ = 0xff;
++    uint8_t in1_ = 0xff;
++    uint8_t dsw_a_ = 0xb0;
++    uint8_t dsw_b_ = 0xcc;
++
++    int64_t audio_accumulator_ = 0;
++    std::vector<int16_t> audio_;
++};
++
++}  // namespace dsp
+diff --git a/src/machine/sega_decrypt.cpp b/src/machine/sega_decrypt.cpp
+new file mode 100644
+index 0000000..54c52b8
+--- /dev/null
++++ b/src/machine/sega_decrypt.cpp
+@@ -0,0 +1,339 @@
++#include "machine/sega_decrypt.h"
++
++namespace dsp {
++namespace {
++
++// Port of sega_decrypt.pas convtable. Index 2 is Pengo.
++constexpr uint8_t kConvTable[9][32][4] = {
++    {
++        { 0xa0, 0x80, 0xa8, 0x88 },
++        { 0xa0, 0x80, 0xa8, 0x88 },
++        { 0x08, 0x88, 0x28, 0xa8 },
++        { 0x28, 0xa8, 0x20, 0xa0 },
++        { 0xa0, 0x80, 0xa8, 0x88 },
++        { 0xa0, 0x80, 0xa8, 0x88 },
++        { 0xa0, 0xa8, 0x20, 0x28 },
++        { 0xa0, 0xa8, 0x20, 0x28 },
++        { 0xa0, 0x80, 0xa8, 0x88 },
++        { 0x20, 0x00, 0xa0, 0x80 },
++        { 0x28, 0xa8, 0x20, 0xa0 },
++        { 0x20, 0x00, 0xa0, 0x80 },
++        { 0xa0, 0xa8, 0x20, 0x28 },
++        { 0xa0, 0xa8, 0x20, 0x28 },
++        { 0x28, 0xa8, 0x20, 0xa0 },
++        { 0xa0, 0xa8, 0x20, 0x28 },
++        { 0x20, 0x00, 0xa0, 0x80 },
++        { 0x80, 0x88, 0xa0, 0xa8 },
++        { 0x80, 0x88, 0xa0, 0xa8 },
++        { 0x80, 0x88, 0xa0, 0xa8 },
++        { 0xa0, 0xa8, 0x20, 0x28 },
++        { 0xa0, 0x80, 0xa8, 0x88 },
++        { 0x80, 0x88, 0xa0, 0xa8 },
++        { 0x28, 0xa8, 0x20, 0xa0 },
++        { 0x20, 0x00, 0xa0, 0x80 },
++        { 0x80, 0x88, 0xa0, 0xa8 },
++        { 0x80, 0x88, 0xa0, 0xa8 },
++        { 0x20, 0x00, 0xa0, 0x80 },
++        { 0xa0, 0xa8, 0x20, 0x28 },
++        { 0xa0, 0x80, 0xa8, 0x88 },
++        { 0x80, 0x88, 0xa0, 0xa8 },
++        { 0x28, 0xa8, 0x20, 0xa0 }
++    },
++    {
++        { 0x20, 0x28, 0x00, 0x08 },
++        { 0x80, 0x00, 0xa0, 0x20 },
++        { 0x20, 0x28, 0x00, 0x08 },
++        { 0xa0, 0xa8, 0x20, 0x28 },
++        { 0x28, 0x08, 0xa8, 0x88 },
++        { 0xa0, 0x80, 0xa8, 0x88 },
++        { 0xa0, 0xa8, 0x20, 0x28 },
++        { 0xa0, 0x80, 0xa8, 0x88 },
++        { 0x20, 0x28, 0x00, 0x08 },
++        { 0x28, 0x08, 0xa8, 0x88 },
++        { 0xa0, 0xa8, 0x20, 0x28 },
++        { 0xa0, 0xa8, 0x20, 0x28 },
++        { 0xa0, 0x80, 0xa8, 0x88 },
++        { 0x28, 0x08, 0xa8, 0x88 },
++        { 0xa0, 0xa8, 0x20, 0x28 },
++        { 0x28, 0x08, 0xa8, 0x88 },
++        { 0x80, 0x00, 0xa0, 0x20 },
++        { 0x80, 0x00, 0xa0, 0x20 },
++        { 0xa0, 0x20, 0xa8, 0x28 },
++        { 0xa0, 0xa8, 0x20, 0x28 },
++        { 0xa0, 0x20, 0xa8, 0x28 },
++        { 0xa0, 0x80, 0xa8, 0x88 },
++        { 0xa0, 0x80, 0xa8, 0x88 },
++        { 0xa0, 0x80, 0xa8, 0x88 },
++        { 0x80, 0x00, 0xa0, 0x20 },
++        { 0x20, 0x28, 0x00, 0x08 },
++        { 0xa0, 0xa8, 0x20, 0x28 },
++        { 0xa0, 0x20, 0xa8, 0x28 },
++        { 0x80, 0x00, 0xa0, 0x20 },
++        { 0xa0, 0x80, 0xa8, 0x88 },
++        { 0xa0, 0xa8, 0x20, 0x28 },
++        { 0xa0, 0x20, 0xa8, 0x28 }
++    },
++    {
++        { 0xa0, 0x80, 0xa8, 0x88 },
++        { 0x28, 0xa8, 0x08, 0x88 },
++        { 0x28, 0xa8, 0x08, 0x88 },
++        { 0xa0, 0x80, 0xa8, 0x88 },
++        { 0xa0, 0x80, 0x20, 0x00 },
++        { 0xa0, 0x80, 0x20, 0x00 },
++        { 0x08, 0x28, 0x88, 0xa8 },
++        { 0xa0, 0x80, 0xa8, 0x88 },
++        { 0x08, 0x00, 0x88, 0x80 },
++        { 0x28, 0xa8, 0x08, 0x88 },
++        { 0xa0, 0x80, 0x20, 0x00 },
++        { 0x08, 0x00, 0x88, 0x80 },
++        { 0xa0, 0x80, 0x20, 0x00 },
++        { 0xa0, 0x80, 0x20, 0x00 },
++        { 0xa0, 0x80, 0x20, 0x00 },
++        { 0x00, 0x08, 0x20, 0x28 },
++        { 0x88, 0x80, 0x08, 0x00 },
++        { 0xa0, 0x80, 0x20, 0x00 },
++        { 0x88, 0x80, 0x08, 0x00 },
++        { 0x00, 0x08, 0x20, 0x28 },
++        { 0x08, 0x28, 0x88, 0xa8 },
++        { 0x08, 0x28, 0x88, 0xa8 },
++        { 0xa0, 0x80, 0xa8, 0x88 },
++        { 0xa0, 0x80, 0x20, 0x00 },
++        { 0x08, 0x00, 0x88, 0x80 },
++        { 0x88, 0x80, 0x08, 0x00 },
++        { 0x00, 0x08, 0x20, 0x28 },
++        { 0x88, 0x80, 0x08, 0x00 },
++        { 0x08, 0x28, 0x88, 0xa8 },
++        { 0x08, 0x28, 0x88, 0xa8 },
++        { 0x08, 0x00, 0x88, 0x80 },
++        { 0xa0, 0x80, 0x20, 0x00 }
++    },
++    {
++        { 0x28, 0xa8, 0x08, 0x88 },
++        { 0x88, 0x80, 0x08, 0x00 },
++        { 0x88, 0x08, 0x80, 0x00 },
++        { 0x88, 0x80, 0x08, 0x00 },
++        { 0x28, 0x08, 0xa8, 0x88 },
++        { 0x28, 0xa8, 0x08, 0x88 },
++        { 0x88, 0x08, 0x80, 0x00 },
++        { 0x88, 0x08, 0x80, 0x00 },
++        { 0x28, 0x08, 0xa8, 0x88 },
++        { 0x88, 0x80, 0x08, 0x00 },
++        { 0x88, 0x80, 0x08, 0x00 },
++        { 0x28, 0xa8, 0x08, 0x88 },
++        { 0xa0, 0x80, 0xa8, 0x88 },
++        { 0x28, 0x08, 0xa8, 0x88 },
++        { 0xa0, 0x80, 0xa8, 0x88 },
++        { 0xa0, 0x80, 0xa8, 0x88 },
++        { 0x88, 0x80, 0x08, 0x00 },
++        { 0x88, 0x80, 0x08, 0x00 },
++        { 0x88, 0x08, 0x80, 0x00 },
++        { 0x88, 0x80, 0x08, 0x00 },
++        { 0xa0, 0x80, 0x20, 0x00 },
++        { 0x28, 0x08, 0xa8, 0x88 },
++        { 0xa0, 0x80, 0x20, 0x00 },
++        { 0x88, 0x08, 0x80, 0x00 },
++        { 0x28, 0x08, 0xa8, 0x88 },
++        { 0xa0, 0x80, 0x20, 0x00 },
++        { 0xa0, 0x80, 0x20, 0x00 },
++        { 0xa0, 0x80, 0x20, 0x00 },
++        { 0xa0, 0x80, 0xa8, 0x88 },
++        { 0x28, 0x08, 0xa8, 0x88 },
++        { 0xa0, 0x80, 0x20, 0x00 },
++        { 0xa0, 0x80, 0xa8, 0x88 }
++    },
++    {
++        { 0x88, 0xa8, 0x80, 0xa0 },
++        { 0x88, 0x08, 0x80, 0x00 },
++        { 0x28, 0xa8, 0x08, 0x88 },
++        { 0xa0, 0xa8, 0x80, 0x88 },
++        { 0xa8, 0xa0, 0x28, 0x20 },
++        { 0xa8, 0xa0, 0x28, 0x20 },
++        { 0x28, 0xa8, 0x08, 0x88 },
++        { 0xa0, 0xa8, 0x80, 0x88 },
++        { 0x28, 0x08, 0xa8, 0x88 },
++        { 0x28, 0x08, 0xa8, 0x88 },
++        { 0x28, 0xa8, 0x08, 0x88 },
++        { 0x88, 0x08, 0x80, 0x00 },
++        { 0x28, 0x08, 0xa8, 0x88 },
++        { 0x28, 0x08, 0xa8, 0x88 },
++        { 0x28, 0xa8, 0x08, 0x88 },
++        { 0xa8, 0xa0, 0x28, 0x20 },
++        { 0x88, 0x08, 0x80, 0x00 },
++        { 0x88, 0xa8, 0x80, 0xa0 },
++        { 0xa0, 0xa8, 0x80, 0x88 },
++        { 0x28, 0xa8, 0x08, 0x88 },
++        { 0xa8, 0xa0, 0x28, 0x20 },
++        { 0x88, 0xa8, 0x80, 0xa0 },
++        { 0xa8, 0xa0, 0x28, 0x20 },
++        { 0x28, 0xa8, 0x08, 0x88 },
++        { 0x28, 0x08, 0xa8, 0x88 },
++        { 0x88, 0xa8, 0x80, 0xa0 },
++        { 0x28, 0x08, 0xa8, 0x88 },
++        { 0x28, 0x08, 0xa8, 0x88 },
++        { 0x88, 0xa8, 0x80, 0xa0 },
++        { 0x88, 0xa8, 0x80, 0xa0 },
++        { 0xa8, 0xa0, 0x28, 0x20 },
++        { 0x28, 0x08, 0xa8, 0x88 }
++    },
++    {
++        { 0x08, 0x88, 0x00, 0x80 },
++        { 0xa0, 0x20, 0x80, 0x00 },
++        { 0xa8, 0xa0, 0x28, 0x20 },
++        { 0x88, 0xa8, 0x80, 0xa0 },
++        { 0x88, 0x80, 0x08, 0x00 },
++        { 0x28, 0x08, 0xa8, 0x88 },
++        { 0x88, 0xa8, 0x80, 0xa0 },
++        { 0x28, 0x08, 0xa8, 0x88 },
++        { 0x88, 0xa8, 0x80, 0xa0 },
++        { 0xa0, 0x20, 0x80, 0x00 },
++        { 0xa8, 0xa0, 0x28, 0x20 },
++        { 0xa8, 0xa0, 0x28, 0x20 },
++        { 0x88, 0x80, 0x08, 0x00 },
++        { 0x88, 0xa8, 0x80, 0xa0 },
++        { 0x88, 0xa8, 0x80, 0xa0 },
++        { 0x88, 0xa8, 0x80, 0xa0 },
++        { 0xa0, 0x20, 0x80, 0x00 },
++        { 0xa0, 0x20, 0x80, 0x00 },
++        { 0x08, 0x88, 0x00, 0x80 },
++        { 0x28, 0x08, 0xa8, 0x88 },
++        { 0x88, 0xa8, 0x80, 0xa0 },
++        { 0x88, 0x80, 0x08, 0x00 },
++        { 0x88, 0xa8, 0x80, 0xa0 },
++        { 0x28, 0x08, 0xa8, 0x88 },
++        { 0x88, 0xa8, 0x80, 0xa0 },
++        { 0x88, 0xa8, 0x80, 0xa0 },
++        { 0x88, 0xa8, 0x80, 0xa0 },
++        { 0x88, 0xa8, 0x80, 0xa0 },
++        { 0x88, 0x80, 0x08, 0x00 },
++        { 0x88, 0x80, 0x08, 0x00 },
++        { 0x08, 0x88, 0x00, 0x80 },
++        { 0x28, 0x08, 0xa8, 0x88 }
++    },
++    {
++        { 0x08, 0x88, 0x00, 0x80 },
++        { 0xa0, 0x80, 0xa8, 0x88 },
++        { 0x80, 0x00, 0xa0, 0x20 },
++        { 0x88, 0x80, 0x08, 0x00 },
++        { 0xa0, 0x80, 0xa8, 0x88 },
++        { 0x28, 0x08, 0x20, 0x00 },
++        { 0x28, 0x08, 0x20, 0x00 },
++        { 0xa0, 0x80, 0xa8, 0x88 },
++        { 0x08, 0x88, 0x00, 0x80 },
++        { 0x80, 0x00, 0xa0, 0x20 },
++        { 0x80, 0x00, 0xa0, 0x20 },
++        { 0x88, 0x80, 0x08, 0x00 },
++        { 0x28, 0x08, 0x20, 0x00 },
++        { 0x28, 0x08, 0x20, 0x00 },
++        { 0x28, 0x08, 0x20, 0x00 },
++        { 0x88, 0x80, 0x08, 0x00 },
++        { 0x08, 0x88, 0x00, 0x80 },
++        { 0xa8, 0x88, 0x28, 0x08 },
++        { 0xa8, 0x88, 0x28, 0x08 },
++        { 0x80, 0x00, 0xa0, 0x20 },
++        { 0x28, 0x08, 0x20, 0x00 },
++        { 0x88, 0x80, 0x08, 0x00 },
++        { 0xa8, 0x88, 0x28, 0x08 },
++        { 0x88, 0x80, 0x08, 0x00 },
++        { 0x08, 0x88, 0x00, 0x80 },
++        { 0x80, 0x00, 0xa0, 0x20 },
++        { 0xa8, 0x88, 0x28, 0x08 },
++        { 0x80, 0x00, 0xa0, 0x20 },
++        { 0x28, 0x08, 0x20, 0x00 },
++        { 0x28, 0x08, 0x20, 0x00 },
++        { 0x08, 0x88, 0x00, 0x80 },
++        { 0x88, 0x80, 0x08, 0x00 }
++    },
++    {
++        { 0x88, 0xa8, 0x80, 0xa0 },
++        { 0x28, 0x20, 0xa8, 0xa0 },
++        { 0x08, 0x28, 0x88, 0xa8 },
++        { 0x88, 0x80, 0x08, 0x00 },
++        { 0xa8, 0x28, 0xa0, 0x20 },
++        { 0x20, 0xa0, 0x00, 0x80 },
++        { 0x88, 0xa8, 0x80, 0xa0 },
++        { 0x28, 0x20, 0xa8, 0xa0 },
++        { 0x08, 0x28, 0x88, 0xa8 },
++        { 0x88, 0x80, 0x08, 0x00 },
++        { 0x88, 0xa8, 0x80, 0xa0 },
++        { 0x28, 0x20, 0xa8, 0xa0 },
++        { 0xa8, 0x28, 0xa0, 0x20 },
++        { 0x20, 0xa0, 0x00, 0x80 },
++        { 0x08, 0x28, 0x88, 0xa8 },
++        { 0x88, 0x80, 0x08, 0x00 },
++        { 0x08, 0x28, 0x88, 0xa8 },
++        { 0x88, 0x80, 0x08, 0x00 },
++        { 0x88, 0xa8, 0x80, 0xa0 },
++        { 0x28, 0x20, 0xa8, 0xa0 },
++        { 0x88, 0xa8, 0x80, 0xa0 },
++        { 0x28, 0x20, 0xa8, 0xa0 },
++        { 0xa8, 0x28, 0xa0, 0x20 },
++        { 0x20, 0xa0, 0x00, 0x80 },
++        { 0xa8, 0x28, 0xa0, 0x20 },
++        { 0x20, 0xa0, 0x00, 0x80 },
++        { 0xa8, 0x28, 0xa0, 0x20 },
++        { 0x20, 0xa0, 0x00, 0x80 },
++        { 0x08, 0x28, 0x88, 0xa8 },
++        { 0x88, 0x80, 0x08, 0x00 },
++        { 0x88, 0xa8, 0x80, 0xa0 },
++        { 0x28, 0x20, 0xa8, 0xa0 }
++    },
++    {
++        { 0x28, 0x08, 0x20, 0x00 },
++        { 0x28, 0x08, 0x20, 0x00 },
++        { 0x80, 0x00, 0xa0, 0x20 },
++        { 0x08, 0x88, 0x00, 0x80 },
++        { 0x80, 0x00, 0xa0, 0x20 },
++        { 0x08, 0x88, 0x00, 0x80 },
++        { 0xa0, 0x80, 0x20, 0x00 },
++        { 0x20, 0x28, 0xa0, 0xa8 },
++        { 0x28, 0x08, 0x20, 0x00 },
++        { 0x88, 0x80, 0xa8, 0xa0 },
++        { 0x80, 0x00, 0xa0, 0x20 },
++        { 0x08, 0x88, 0x00, 0x80 },
++        { 0x80, 0x00, 0xa0, 0x20 },
++        { 0x20, 0x28, 0xa0, 0xa8 },
++        { 0x20, 0x28, 0xa0, 0xa8 },
++        { 0x08, 0x88, 0x00, 0x80 },
++        { 0x88, 0x80, 0xa8, 0xa0 },
++        { 0x28, 0x08, 0x20, 0x00 },
++        { 0x80, 0x00, 0xa0, 0x20 },
++        { 0xa0, 0x80, 0x20, 0x00 },
++        { 0x20, 0x28, 0xa0, 0xa8 },
++        { 0x08, 0x88, 0x00, 0x80 },
++        { 0x80, 0x00, 0xa0, 0x20 },
++        { 0x20, 0x28, 0xa0, 0xa8 },
++        { 0x88, 0x80, 0xa8, 0xa0 },
++        { 0x88, 0x80, 0xa8, 0xa0 },
++        { 0x80, 0x00, 0xa0, 0x20 },
++        { 0x08, 0x88, 0x00, 0x80 },
++        { 0x80, 0x00, 0xa0, 0x20 },
++        { 0x28, 0x08, 0x20, 0x00 },
++        { 0x20, 0x28, 0xa0, 0xa8 },
++        { 0xa0, 0x80, 0x20, 0x00 }
++    }
++};
++
++}  // namespace
++
++void decrypt_sega(uint8_t* data, uint8_t* opcodes, int game, size_t length) {
++    if (game < 0 || game > 8) return;
++    if (length > 0x8000) length = 0x8000;
++    for (size_t address = 0; address < length; address++) {
++        uint8_t src = data[address];
++        uint8_t xorr = 0;
++        // pick the translation table from bits 0, 4, 8 and 12 of the address
++        int row = int(address & 1) + (int((address >> 4) & 1) << 1) +
++                  (int((address >> 8) & 1) << 2) + (int((address >> 12) & 1) << 3);
++        // pick the offset in the table from bits 3 and 5 of the source data
++        int col = int((src >> 3) & 1) + (int((src >> 5) & 1) << 1);
++        // the bottom half of the translation table is the mirror image of the top
++        if (src & 0x80) {
++            col = 3 - col;
++            xorr = 0xa8;
++        }
++        opcodes[address] = uint8_t((src & ~0xa8) | (kConvTable[game][2 * row][col] ^ xorr));
++        data[address] = uint8_t((src & ~0xa8) | (kConvTable[game][2 * row + 1][col] ^ xorr));
++    }
++}
++
++}  // namespace dsp
+diff --git a/src/machine/sega_decrypt.h b/src/machine/sega_decrypt.h
+new file mode 100644
+index 0000000..b990806
+--- /dev/null
++++ b/src/machine/sega_decrypt.h
+@@ -0,0 +1,14 @@
++#pragma once
++
++#include <cstddef>
++#include <cstdint>
++
++namespace dsp {
++
++// Sega Z80 opcode/data decryptor, ported from sega_decrypt.pas.
++// `game` selects the conversion table; Pengo uses index 2.
++// On entry `data` holds the encrypted ROM. On return `data` holds the
++// decrypted data bytes and `opcodes` holds the decrypted opcode bytes.
++void decrypt_sega(uint8_t* data, uint8_t* opcodes, int game, size_t length = 0x8000);
++
++}  // namespace dsp
+diff --git a/src/main.cpp b/src/main.cpp
+index 91fc063..d161452 100644
+--- a/src/main.cpp
++++ b/src/main.cpp
+@@ -11,6 +11,7 @@
+ #include "drivers/doubledragon.h"
+ #include "drivers/gauntlet.h"
+ #include "drivers/mikie.h"
++#include "drivers/pengo.h"
+ #include "frontend/sdl_app.h"
+ 
+ namespace {
+@@ -24,14 +25,15 @@ void print_usage(const char* program) {
+     std::printf(
+         "Usage: %s [options] <romset.zip | rom directory>\n"
+         "\n"
+-        "Games: bagman (default), mikie, gauntlet, ddragon, ddragon2\n"
++        "Games: bagman (default), mikie, gauntlet, ddragon, ddragon2, pengo\n"
+         "\n"
+         "Options:\n"
+-        "  --game NAME        game to run: bagman, mikie, gauntlet, ddragon or\n"
+-        "                     ddragon2\n"
++        "  --game NAME        game to run: bagman, mikie, gauntlet, ddragon,\n"
++        "                     ddragon2 or pengo\n"
+         "  --scale N          window scale factor (default 3)\n"
+         "  --dip [BANK:]VALUE DIP switch byte, decimal or 0x hex; bagman has one\n"
+-        "                     bank, mikie has three (0=A, 1=B, 2=C)\n"
++        "                     bank, mikie has three (0=A, 1=B, 2=C),\n"
++        "                     pengo has two (0=A gameplay, 1=B coinage)\n"
+         "  --mute             disable audio\n"
+         "  --fullscreen       start in full screen\n"
+         "  --screenshot FILE  headless mode: render frames and write FILE (BMP)\n"
+@@ -52,6 +54,7 @@ std::string guess_game(const std::string& rom_path) {
+     if (lowered.find("gauntlet") != std::string::npos) return "gauntlet";
+     if (lowered.find("ddragon2") != std::string::npos) return "ddragon2";
+     if (lowered.find("ddragon") != std::string::npos) return "ddragon";
++    if (lowered.find("pengo") != std::string::npos) return "pengo";
+     return "bagman";
+ }
+ 
+@@ -65,6 +68,7 @@ std::unique_ptr<dsp::Machine> create_machine(const std::string& game) {
+     if (game == "ddragon2") {
+         return std::make_unique<dsp::DoubleDragon>(dsp::DoubleDragon::Variant::DDragon2);
+     }
++    if (game == "pengo") return std::make_unique<dsp::Pengo>();
+     return nullptr;
+ }
+ 
+diff --git a/src/sound/namco_snd.cpp b/src/sound/namco_snd.cpp
+new file mode 100644
+index 0000000..c37eb87
+--- /dev/null
++++ b/src/sound/namco_snd.cpp
+@@ -0,0 +1,104 @@
++#include "sound/namco_snd.h"
++
++#include <algorithm>
++
++namespace dsp {
++namespace {
++
++// Resample factors from namco_snd.pas: round(96_000_000 / 44100) and
++// round(24_000_000 / 44100).
++constexpr int kResample96 = 2177;
++constexpr int kResample24 = 544;
++
++}  // namespace
++
++NamcoSnd::NamcoSnd(int voices) : voices_(std::clamp(voices, 1, kMaxVoices)) {}
++
++void NamcoSnd::set_wave_prom(const std::vector<uint8_t>& prom) {
++    wave_prom_.fill(0);
++    const size_t count = std::min(prom.size(), wave_prom_.size());
++    std::copy_n(prom.begin(), count, wave_prom_.begin());
++    for (int offset = 0; offset < 0x100; offset++) update_waveform(offset, wave_prom_[size_t(offset)]);
++}
++
++void NamcoSnd::update_waveform(int offset, uint8_t data) {
++    // PROM mode uses only the low nibble of each byte.
++    decoded_wave_[size_t(offset)] = uint8_t(data & 0x0f);
++}
++
++void NamcoSnd::reset() {
++    enabled_ = true;
++    regs_.fill(0);
++    for (Voice& voice : voice_) {
++        voice = Voice{};
++    }
++    for (int offset = 0; offset < 0x100; offset++) update_waveform(offset, wave_prom_[size_t(offset)]);
++}
++
++void NamcoSnd::write_reg(int offset, uint8_t value) { regs_[size_t(offset & 0x3f)] = value; }
++
++uint8_t NamcoSnd::read_reg(int offset) const { return regs_[size_t(offset & 0x3f)]; }
++
++void NamcoSnd::refresh_voice_3(int index) {
++    const int base = 5 * index;
++    Voice& voice = voice_[size_t(index)];
++    voice.wave = uint8_t(regs_[size_t(0x05 + base)] & 7);
++    voice.volume = uint8_t((regs_[size_t(0x15 + base)] & 0x0f) >> 1);
++
++    int frequency = (regs_[size_t(0x14 + base)] & 0x0f) << 16;
++    frequency |= (regs_[size_t(0x13 + base)] & 0x0f) << 12;
++    frequency |= (regs_[size_t(0x12 + base)] & 0x0f) << 8;
++    frequency |= (regs_[size_t(0x11 + base)] & 0x0f) << 4;
++    if (index == 0) frequency |= regs_[0x10] & 0x0f;
++
++    voice.frequency = frequency * kResample96;
++    if (voice.frequency == 0 || voice.volume == 0) {
++        voice.active = false;
++        voice.position = 0;
++    } else {
++        voice.active = true;
++    }
++}
++
++void NamcoSnd::refresh_voice_8(int index) {
++    const int base = (8 * index) + 0x03;
++    Voice& voice = voice_[size_t(index)];
++    voice.wave = uint8_t(regs_[size_t(0x03 + base)] >> 4);
++    voice.volume = uint8_t((regs_[size_t(0x00 + base)] & 0x0f) >> 1);
++
++    int frequency = regs_[size_t(0x01 + base)];
++    frequency |= regs_[size_t(0x02 + base)] << 8;
++    frequency |= (regs_[size_t(0x03 + base)] & 0x0f) << 16;
++
++    voice.frequency = frequency * kResample24;
++    if (voice.frequency == 0 && voice.volume == 0) {
++        voice.active = false;
++        voice.position = 0;
++    } else {
++        voice.active = true;
++    }
++}
++
++int32_t NamcoSnd::update() {
++    if (!enabled_) return 0;
++
++    int sample = 0;
++    for (int index = 0; index < voices_; index++) {
++        if (voices_ == 3) {
++            refresh_voice_3(index);
++        } else {
++            refresh_voice_8(index);
++        }
++        Voice& voice = voice_[size_t(index)];
++        if (!voice.active) continue;
++        const uint32_t offset = voice.position;
++        const int wave_base = 32 * voice.wave;
++        sample += (decoded_wave_[size_t(wave_base + int((offset >> 25) & 0x1f))] * voice.volume) << 6;
++        voice.position = offset + uint32_t(voice.frequency);
++    }
++
++    sample = (sample / voices_) * 4;
++    return std::clamp(sample, -32768, 32767);
++}
++
++}  // namespace dsp
+diff --git a/src/sound/namco_snd.h b/src/sound/namco_snd.h
+new file mode 100644
+index 0000000..a016d32
+--- /dev/null
++++ b/src/sound/namco_snd.h
+@@ -0,0 +1,53 @@
++#pragma once
++
++#include <array>
++#include <cstdint>
++#include <vector>
++
++namespace dsp {
++
++// Namco waveform sound generator (3 or 8 voices), ported from namco_snd.pas.
++// Pengo uses the 3-voice PROM-backed mode.
++class NamcoSnd {
++public:
++    static constexpr int kSampleRate = 44100;
++    static constexpr int kMaxVoices = 8;
++
++    explicit NamcoSnd(int voices = 3);
++
++    void reset();
++    void set_enabled(bool enabled) { enabled_ = enabled; }
++    bool enabled() const { return enabled_; }
++
++    // 32-byte (3-voice) or 64-byte (8-voice) register file.
++    void write_reg(int offset, uint8_t value);
++    uint8_t read_reg(int offset) const;
++
++    // Loads the 256-byte waveform PROM used by the 3/8-voice Pac-Man style chip.
++    void set_wave_prom(const std::vector<uint8_t>& prom);
++
++    // Generates the next mixed sample at kSampleRate.
++    int32_t update();
++
++private:
++    struct Voice {
++        uint8_t volume = 0;
++        uint8_t wave = 0;
++        int frequency = 0;
++        bool active = false;
++        uint32_t position = 0;
++    };
++
++    void update_waveform(int offset, uint8_t data);
++    void refresh_voice_3(int index);
++    void refresh_voice_8(int index);
++
++    int voices_;
++    bool enabled_ = true;
++    std::array<uint8_t, 0x40> regs_{};
++    std::array<uint8_t, 0x100> wave_prom_{};
++    std::array<uint8_t, 0x200> decoded_wave_{};
++    std::array<Voice, kMaxVoices> voice_{};
++};
++
++}  // namespace dsp
+diff --git a/tests/tests.cpp b/tests/tests.cpp
+index c42d64b..ebbfda5 100644
+--- a/tests/tests.cpp
++++ b/tests/tests.cpp
+@@ -9,9 +9,11 @@
+ #include "cpu/m68000.h"
+ #include "cpu/z80.h"
+ #include "machine/bagman_pal.h"
++#include "machine/sega_decrypt.h"
+ #include "machine/slapstic.h"
+ #include "sound/ay8910.h"
+ #include "sound/msm5205.h"
++#include "sound/namco_snd.h"
+ #include "sound/okim6295.h"
+ #include "sound/pokey.h"
+ #include "sound/sn76496.h"
+@@ -626,6 +628,75 @@ void test_msm5205() {
+     check(chip.output() == 0, "resetting the MSM5205 silences it");
+ }
+ 
++void test_sega_decrypt_pengo() {
++    // Encrypted byte 0x00 at address 0 uses Pengo table row 0, col 0.
++    std::vector<uint8_t> data(0x8000, 0);
++    std::vector<uint8_t> opcodes(0x8000, 0);
++    data[0] = 0x00;
++    dsp::decrypt_sega(data.data(), opcodes.data(), 2, 0x8000);
++    check(opcodes[0] == 0xa0, "Pengo decrypts opcode 0x00 at address 0 to 0xa0");
++    check(data[0] == 0x28, "Pengo decrypts data 0x00 at address 0 to 0x28");
++
++    // High bit set mirrors the column and xors 0xa8.
++    data.assign(0x8000, 0);
++    opcodes.assign(0x8000, 0);
++    data[0] = 0x80;
++    dsp::decrypt_sega(data.data(), opcodes.data(), 2, 0x8000);
++    check(opcodes[0] == uint8_t(0x88 ^ 0xa8), "Pengo mirrors opcode column when bit 7 is set");
++    check(data[0] == uint8_t(0x88 ^ 0xa8), "Pengo mirrors data column when bit 7 is set");
++}
++
++void test_namco_snd() {
++    dsp::NamcoSnd chip(3);
++    std::vector<uint8_t> prom(0x100, 0);
++    for (int index = 0; index < 0x100; index++) prom[index] = 0x0f;
++    chip.set_wave_prom(prom);
++    chip.reset();
++    check(chip.update() == 0, "a silent Namco chip produces zero");
++
++    // Voice 0: select wave 0, non-zero frequency and volume.
++    chip.write_reg(0x05, 0x00);  // wave
++    chip.write_reg(0x15, 0x0f);  // volume
++    chip.write_reg(0x10, 0x0f);
++    chip.write_reg(0x11, 0x0f);
++    chip.write_reg(0x12, 0x0f);
++    chip.write_reg(0x13, 0x0f);
++    chip.write_reg(0x14, 0x0f);
++    int32_t sample = chip.update();
++    check(sample != 0, "a programmed Namco voice produces output");
++
++    chip.set_enabled(false);
++    check(chip.update() == 0, "disabling the Namco chip silences it");
++}
++
++void test_z80_opcode_fetch_flag() {
++    auto memory = make_memory();
++    auto opcodes = make_memory();
++    // Encrypted-style split: opcodes[0]=ld a,0x42 (0x3e, 0x42), data differs.
++    memory[0] = 0x00;
++    memory[1] = 0x00;
++    opcodes[0] = 0x3e;
++    opcodes[1] = 0x42;
++    dsp::Z80 cpu(3072000);
++    cpu.set_memory_handlers(
++        [&](uint16_t address) {
++            return cpu.opcode_fetch() ? opcodes[address] : memory[address];
++        },
++        [&](uint16_t address, uint8_t value) { memory[address] = value; });
++    cpu.reset();
++    cpu.run(7);  // ld a,imm — opcode from opcodes[], immediate from memory[]
++    // Immediate came from data ROM (0x00), so A should be 0.
++    check(cpu.a == 0x00, "immediate operands use the data read path");
++
++    memory[0] = 0x3e;
++    memory[1] = 0x99;
++    opcodes[0] = 0x3e;
++    opcodes[1] = 0x99;
++    cpu.reset();
++    cpu.run(7);
++    check(cpu.a == 0x99, "matching opcode/data banks still load immediates");
++}
++
+ void test_okim6295() {
+     dsp::OKIM6295 chip(1056000, true);
+     check(chip.sample_frequency() == 8000, "pin 7 high selects the /132 divider");
+@@ -681,6 +752,9 @@ int main() {
+     test_hd63701_interrupts();
+     test_msm5205();
+     test_okim6295();
++    test_sega_decrypt_pengo();
++    test_namco_snd();
++    test_z80_opcode_fetch_flag();
+     if (failures == 0) {
+         std::printf("all tests passed\n");
+         return 0;
+-- 
+2.43.0
+
